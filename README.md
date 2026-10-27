@@ -184,7 +184,7 @@ npm run build        # typecheck + bundle -> main.js
 ```
 
 Copy `main.js`, `manifest.json` and `styles.css` into
-`<vault>/.obsidian/plugins/e2ee-vault-sync/` and enable **E2EE Vault Sync** in
+`<vault>/.obsidian/plugins/end-to-end-vault-sync/` and enable **E2EE Vault Sync** in
 Community plugins. For development: `npm run dev` (watch mode) and reload
 Obsidian.
 

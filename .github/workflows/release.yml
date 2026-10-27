@@ -40,6 +40,6 @@ jobs:
           prerelease: false
           body: >
             Obsidian plugin build for the tag. Install main.js, manifest.json
-            and styles.css into .obsidian/plugins/e2ee-vault-sync/. The release
+            and styles.css into .obsidian/plugins/end-to-end-vault-sync/. The release
             tag equals the version in manifest.json, as required by the
             community plugin directory.

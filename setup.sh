@@ -19,7 +19,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVER_DIR="$SCRIPT_DIR/server"
 PLUGIN_DIR="$SCRIPT_DIR/plugin"
-PLUGIN_ID="e2ee-vault-sync"
+PLUGIN_ID="end-to-end-vault-sync"
 RUN_ENV="$SERVER_DIR/run.env"
 PID_FILE="$SERVER_DIR/server.pid"
 LOG_FILE="$SERVER_DIR/server.log"

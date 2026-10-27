@@ -1,5 +1,5 @@
 {
-  "id": "e2ee-vault-sync",
+  "id": "end-to-end-vault-sync",
   "name": "E2EE Vault Sync",
   "version": "0.1.0",
   "minAppVersion": "1.4.0",
