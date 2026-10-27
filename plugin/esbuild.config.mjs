@@ -1,5 +1,6 @@
 import esbuild from "esbuild";
 import process from "process";
+import fs from "fs";
 import builtinModules from "builtin-modules";
 
 const banner = `/*
@@ -34,6 +35,9 @@ const context = await esbuild.context({
 
 if (production) {
   await context.rebuild();
+  // The community directory reads manifest.json from the repository root;
+  // plugin/manifest.json is a build copy consumed by the setup wizards.
+  fs.copyFileSync("../manifest.json", "manifest.json");
   process.exit(0);
 } else {
   await context.watch();
