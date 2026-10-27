@@ -1,0 +1,39 @@
+# /etc/systemd/system/obsidian-e2ee-sync.service
+# systemd unit for the Obsidian E2EE sync server.
+#
+# Install:
+#   1. Copy server.js to /opt/obsidian-sync/server/server.js
+#   2. mkdir -p /opt/obsidian-sync/data && chown -R obsidian-sync: /opt/obsidian-sync
+#   3. Put the token in /etc/obsidian-e2ee-sync.env :
+#        AUTH_TOKEN=<output of: openssl rand -hex 32>
+#      chmod 600 /etc/obsidian-e2ee-sync.env
+#   4. systemctl daemon-reload && systemctl enable --now obsidian-e2ee-sync
+
+[Unit]
+Description=Obsidian E2EE sync server (dumb encrypted storage)
+After=network.target
+
+[Service]
+Type=simple
+User=obsidian-sync
+Group=obsidian-sync
+WorkingDirectory=/opt/obsidian-sync/server
+ExecStart=/usr/bin/node server.js
+Environment=PORT=8080
+Environment=HOST=127.0.0.1
+Environment=DATA_DIR=/opt/obsidian-sync/data
+# Optional: expire tombstones older than N days (leave unset to keep forever):
+# Environment=TOMBSTONE_TTL_DAYS=180
+EnvironmentFile=-/etc/obsidian-e2ee-sync.env
+Restart=on-failure
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/obsidian-sync/data
+
+[Install]
+WantedBy=multi-user.target

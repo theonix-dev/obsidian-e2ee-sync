@@ -1,0 +1,53 @@
+# /etc/nginx/sites-available/obsidian-sync
+# Reverse proxy with TLS for the E2EE sync server.
+#
+# 1. DNS: point sync.example.com at your VPS.
+# 2. Certbot: certbot --nginx -d sync.example.com   (it rewrites the ssl lines)
+# 3. ln -s /etc/nginx/sites-available/obsidian-sync /etc/nginx/sites-enabled/
+# 4. nginx -t && systemctl reload nginx
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name sync.example.com;
+    # Certbot uses this block for the ACME challenge; it will add a redirect
+    # to https once the certificate exists.
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name sync.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/sync.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/sync.example.com/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+
+    # Largest single encrypted attachment you expect to sync (server default
+    # body cap is 256 MiB — keep both in sync).
+    client_max_body_size 300m;
+
+    # Optional but recommended: blunt brute-force attempts against the token.
+    # limit_req_zone $binary_remote_addr zone=e2ee_sync:10m rate=10r/s;
+    # limit_req zone=e2ee_sync burst=30 nodelay;
+
+    location /api/ {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        # Large encrypted attachments: do not buffer, stream straight through.
+        proxy_request_buffering off;
+        proxy_buffering off;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+
+    location = / {
+        return 404;
+    }
+}
