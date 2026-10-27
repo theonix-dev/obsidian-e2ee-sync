@@ -38,10 +38,11 @@ const IGNORE_WINDOW_MS = 500;
 const JOURNAL_FLUSH_EVERY = 20;
 
 /** Vault folders that must never round-trip to the server. */
-const EXCLUDED_PREFIXES = ['.obsidian/', '.trash/'];
+const EXCLUDED_PREFIXES = ['.trash/'];
 
-export function isSyncablePath(p: string): boolean {
-  for (const prefix of EXCLUDED_PREFIXES) {
+export function isSyncablePath(p: string, configDir: string): boolean {
+  const prefixes = [`${configDir.replace(/\/+$/, '')}/`, ...EXCLUDED_PREFIXES];
+  for (const prefix of prefixes) {
     if (p === prefix.slice(0, -1) || p.startsWith(prefix)) return false;
   }
   return true;
@@ -106,8 +107,12 @@ export class SyncEngine {
   private running = false;
   private rerunRequested = false;
   private journalOpsSinceFlush = 0;
+  /** Obsidian's configuration folder (Vault#configDir) — excluded from sync. */
+  private readonly configDir: string;
 
-  constructor(private readonly ctx: EngineContext) {}
+  constructor(private readonly ctx: EngineContext) {
+    this.configDir = ctx.app.vault.configDir;
+  }
 
   dispose(): void {
     for (const t of this.debounces.values()) window.clearTimeout(t);
@@ -144,14 +149,14 @@ export class SyncEngine {
    * logic handles both halves naturally, so we just schedule a sync run.
    */
   onLocalRenamed(oldPath: string, newPath: string): void {
-    const oldSyncable = isSyncablePath(oldPath);
-    const newSyncable = isSyncablePath(newPath);
+    const oldSyncable = isSyncablePath(oldPath, this.configDir);
+    const newSyncable = isSyncablePath(newPath, this.configDir);
     if (oldSyncable) this.onLocalTouched(oldPath);
     if (newSyncable) this.onLocalTouched(newPath);
   }
 
   private onLocalTouched(path: string): void {
-    if (!isSyncablePath(path) || this.ignorePaths.has(path)) return;
+    if (!isSyncablePath(path, this.configDir) || this.ignorePaths.has(path)) return;
     const existing = this.debounces.get(path);
     if (existing !== undefined) window.clearTimeout(existing);
 
@@ -239,7 +244,7 @@ export class SyncEngine {
   private collectLocalFiles(): Map<string, TFile> {
     const out = new Map<string, TFile>();
     for (const file of this.ctx.app.vault.getFiles()) {
-      if (isSyncablePath(file.path)) out.set(file.path, file);
+      if (isSyncablePath(file.path, this.configDir)) out.set(file.path, file);
     }
     return out;
   }
@@ -258,7 +263,7 @@ export class SyncEngine {
 
     const ops: PlannedOp[] = [];
     for (const path of paths) {
-      if (!isSyncablePath(path)) continue;
+      if (!isSyncablePath(path, this.configDir)) continue;
 
       const local: TFile | undefined = locals.get(path);
       const record: SyncRecord | undefined = journal[path];
