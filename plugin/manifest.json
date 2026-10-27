@@ -5,5 +5,7 @@
   "minAppVersion": "1.4.0",
   "description": "File-by-file end-to-end encrypted sync (AES-GCM + PBKDF2) to your own server. Desktop & mobile.",
   "author": "theonix-dev",
+  "authorUrl": "https://theonix.dev/",
+  "fundingUrl": "https://donatello.to/theonix",
   "isDesktopOnly": false
 }
