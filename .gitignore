@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+
+# Build artifacts (main.js IS tracked on purpose: the setup installer can
+# install the plugin on machines without npm/node toolchain)
+plugin/*.map
+
+# Server runtime state — never commit (contains vault metadata)
+server/data/
+
+# Wizard-generated config with the API token, runtime pid and logs
+server/run.env
+server/server.pid
+server/*.log
+server/*.tmp
+*.log
+
+# OS / editor noise
+.DS_Store
+.vscode/
+.idea/
+*.swp

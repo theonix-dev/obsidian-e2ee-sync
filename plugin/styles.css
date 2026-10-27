@@ -1,0 +1,38 @@
+/* Ribbon icon state indicators (the ribbon is the mobile-friendly mirror of
+ * the status bar, which Obsidian hides on mobile). */
+
+.e2ee-ribbon-syncing > svg {
+  animation: e2ee-spin 1.1s linear infinite;
+}
+
+@keyframes e2ee-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.e2ee-ribbon-synced { color: var(--text-success, #4caf50); }
+.e2ee-ribbon-error { color: var(--text-error, #e53935); }
+.e2ee-ribbon-offline { color: var(--text-faint); opacity: 0.6; }
+.e2ee-ribbon-idle { color: var(--text-normal); opacity: 0.8; }
+
+/* Status bar item (desktop only). */
+
+.status-bar-item.e2ee-syncing { color: var(--text-accent); }
+.status-bar-item.e2ee-synced { color: var(--text-success, #4caf50); }
+.status-bar-item.e2ee-error { color: var(--text-error, #e53935); }
+.status-bar-item.e2ee-offline { color: var(--text-faint); }
+.status-bar-item.e2ee-idle { color: var(--text-muted); }
+
+/* Settings tab helpers */
+
+.e2ee-setting-warning {
+  color: var(--text-warning, #e0a800);
+  font-size: var(--font-ui-smaller);
+  margin-top: 0.25em;
+}
+
+.e2ee-setting-note {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  white-space: pre-line;
+}
