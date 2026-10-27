@@ -288,8 +288,7 @@ server):
 Releases are automated: pushing a git tag triggers the release workflow, which
 builds the plugin (typecheck + esbuild bundle) and publishes a GitHub release
 containing `main.js`, `manifest.json` and `styles.css`. The tag must equal the
-`version` field in `plugin/manifest.json` — a hard requirement of the
-directory.
+`version` field in `plugin/manifest.json`.
 
 ```bash
 # 1. Bump version in plugin/manifest.json and plugin/package.json,
@@ -298,31 +297,23 @@ directory.
 git tag 0.1.0 && git push origin main 0.1.0
 ```
 
-Submitting the plugin to the Obsidian community catalog then requires two pull
-requests in the public repositories `obsidianmd/obsidian-releases`:
+Submission to the directory is performed through the web portal
+[community.obsidian.md](https://community.obsidian.md): sign in with an
+Obsidian account, link the GitHub account that owns the plugin repository,
+and add the plugin there. Only the initial version is submitted this way;
+subsequent releases are pulled by the directory from this repository's
+GitHub releases automatically, matched by tag. The directory reads
+`manifest.json` at the HEAD of the default branch, so it must be committed
+before submitting.
 
-1. **`community-plugins.json`** — append:
-
-```json
-{
-  "id": "e2ee-vault-sync",
-  "name": "E2EE Vault Sync",
-  "author": "theonix-dev",
-  "description": "File-by-file end-to-end encrypted sync (AES-GCM + PBKDF2) to your own server. Desktop & mobile.",
-  "repo": "theonix-dev/obsidian-e2ee-sync"
-}
-```
-
-2. **`versions.json`** in the same repository — append:
-
-```json
-"0.1.0": "1.4.0"
-```
-
-Pre-submission review requirements are covered by this repository: an MIT
-`LICENSE` at the repository root, a valid `manifest.json` (id matching the
-installation folder, no restricted naming, semver version), a `versions.json`
-at the repository root, and mobile compatibility with `isDesktopOnly: false`.
+Pre-submission requirements are covered by this repository: an MIT `LICENSE`
+at the repository root, a descriptive `README.md` (excerpted on the public
+listing page), a valid `manifest.json` (unique id, no restricted naming,
+`x.y.z` semver), a `versions.json` mapping plugin versions to minimum
+Obsidian versions (consulted when a release requires a newer app version),
+and mobile compatibility with `isDesktopOnly: false`. While awaiting or
+instead of directory review, the plugin can be distributed for beta testing
+via the [BRAT](https://obsidian.md/plugins?id=obsidian42-brat) plugin.
 
 ## Mobile platform compliance
 
