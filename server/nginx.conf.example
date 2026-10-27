@@ -31,7 +31,8 @@ server {
     # body cap is 256 MiB — keep both in sync).
     client_max_body_size 300m;
 
-    # Optional but recommended: blunt brute-force attempts against the token.
+    # Optional but recommended: rate limiting mitigates brute-force attacks
+    # against the bearer token.
     # limit_req_zone $binary_remote_addr zone=e2ee_sync:10m rate=10r/s;
     # limit_req zone=e2ee_sync burst=30 nodelay;
 

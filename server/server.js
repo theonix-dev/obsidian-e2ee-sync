@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 /**
- * Obsidian E2EE Sync — "dumb storage" server.
+ * Obsidian E2EE Sync — storage server.
  *
  * Zero npm dependencies: Node.js built-ins only (Node >= 18).
  *
- * The server stores opaque encrypted blobs and knows NOTHING about keys or
- * plaintext. It exposes:
+ * The server operates as an untrusted ciphertext store: it persists opaque
+ * encrypted blobs and maintains a per-path index, and receives neither
+ * encryption keys nor plaintext. It exposes:
  *
  *   GET    /api/meta                  -> { vaultId }            (stable KDF salt source)
  *   GET    /api/index                 -> full index incl. tombstones
@@ -381,7 +382,7 @@ async function main() {
   server.listen(PORT, HOST, () => {
     console.log(`[obsidian-e2ee-sync] listening on http://${HOST}:${PORT}`);
     console.log(`[obsidian-e2ee-sync] data dir: ${DATA_DIR} (${index.size} index entries, vaultId ${meta.vaultId.slice(0, 8)}…)`);
-    console.log('[obsidian-e2ee-sync] put nginx + HTTPS in front before exposing this to the internet');
+    console.log('[obsidian-e2ee-sync] terminate TLS with nginx + HTTPS before exposing this to the internet');
   });
 }
 

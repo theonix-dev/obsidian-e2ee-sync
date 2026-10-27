@@ -1,5 +1,5 @@
 # /etc/systemd/system/obsidian-e2ee-sync.service
-# systemd unit for the Obsidian E2EE sync server.
+# systemd unit for the Obsidian E2EE sync storage server.
 #
 # Install:
 #   1. Copy server.js to /opt/obsidian-sync/server/server.js
@@ -10,7 +10,7 @@
 #   4. systemctl daemon-reload && systemctl enable --now obsidian-e2ee-sync
 
 [Unit]
-Description=Obsidian E2EE sync server (dumb encrypted storage)
+Description=Obsidian E2EE sync storage server (untrusted ciphertext store)
 After=network.target
 
 [Service]
