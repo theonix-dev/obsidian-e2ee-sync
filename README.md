@@ -283,6 +283,47 @@ server):
 7. **Zero-plaintext audit.** `grep -r "<distinctive phrase from a note>"
    <DATA_DIR>` must return nothing.
 
+## Publishing to the community plugin directory
+
+Releases are automated: pushing a git tag triggers the release workflow, which
+builds the plugin (typecheck + esbuild bundle) and publishes a GitHub release
+containing `main.js`, `manifest.json` and `styles.css`. The tag must equal the
+`version` field in `plugin/manifest.json` — a hard requirement of the
+directory.
+
+```bash
+# 1. Bump version in plugin/manifest.json and plugin/package.json,
+#    add the entry to versions.json ("<version>": "<minAppVersion>").
+# 2. Commit, then:
+git tag 0.1.0 && git push origin main 0.1.0
+```
+
+Submitting the plugin to the Obsidian community catalog then requires two pull
+requests in the public repositories `obsidianmd/obsidian-releases`:
+
+1. **`community-plugins.json`** — append:
+
+```json
+{
+  "id": "e2ee-vault-sync",
+  "name": "E2EE Vault Sync",
+  "author": "theonix-dev",
+  "description": "File-by-file end-to-end encrypted sync (AES-GCM + PBKDF2) to your own server. Desktop & mobile.",
+  "repo": "theonix-dev/obsidian-e2ee-sync"
+}
+```
+
+2. **`versions.json`** in the same repository — append:
+
+```json
+"0.1.0": "1.4.0"
+```
+
+Pre-submission review requirements are covered by this repository: an MIT
+`LICENSE` at the repository root, a valid `manifest.json` (id matching the
+installation folder, no restricted naming, semver version), a `versions.json`
+at the repository root, and mobile compatibility with `isDesktopOnly: false`.
+
 ## Mobile platform compliance
 
 The bundled `main.js` contains exactly one external import:

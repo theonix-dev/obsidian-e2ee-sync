@@ -1,0 +1,45 @@
+name: Release Obsidian plugin
+
+on:
+  push:
+    tags:
+      - "*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build plugin (typecheck + bundle)
+        working-directory: plugin
+        run: |
+          npm install --no-fund --no-audit
+          npm run build
+
+      - name: Stage release artifacts
+        run: |
+          mkdir -p dist
+          cp plugin/main.js plugin/manifest.json plugin/styles.css dist/
+
+      - name: Create GitHub release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          artifacts: "dist/main.js,dist/manifest.json,dist/styles.css"
+          allowUpdates: true
+          draft: false
+          prerelease: false
+          body: >
+            Obsidian plugin build for the tag. Install main.js, manifest.json
+            and styles.css into .obsidian/plugins/e2ee-vault-sync/. The release
+            tag equals the version in manifest.json, as required by the
+            community plugin directory.
