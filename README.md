@@ -1,4 +1,4 @@
-# Obsidian E2EE Sync
+# E2EE Vault Sync
 
 File-by-file, end-to-end-encrypted synchronization for Obsidian vaults against a
 self-hosted server. Operates on desktop (Windows, macOS, Linux), Android and iOS.
