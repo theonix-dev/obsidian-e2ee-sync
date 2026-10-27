@@ -58,8 +58,13 @@ plugin/          Obsidian plugin (TypeScript)
 server/          Zero-dependency Node.js REST API (Node >= 18)
   server.js          storage service implementation
   test-e2e.mjs       42-assertion integration test (spawns the server, exercises crypto + REST)
+  Dockerfile         container image (unprivileged node user, healthcheck)
   nginx.conf.example reverse proxy with TLS
   obsidian-e2ee-sync.service  hardened systemd unit
+install.sh       curl|bash bootstrap installer (clones the repository, runs the wizard)
+setup.sh/.ps1    interactive setup wizards (bash 3.2+ / PowerShell 5.1+)
+docker-compose.yml, .env.example   containerized deployment
+Makefile         operator conveniences: up/down/logs/backup/restore/test
 ```
 
 ## Quick start (one-liner)
@@ -107,6 +112,36 @@ sudo nginx -t && sudo systemctl reload nginx
 # 5. Firewall
 sudo ufw allow 443/tcp && sudo ufw enable   # the Node server remains bound to 127.0.0.1
 ```
+
+### Containerized deployment (Docker Compose)
+
+Requires Docker Engine with the Compose plugin. This is the recommended
+deployment model when a systemd unit is not applicable.
+
+```bash
+cp .env.example .env          # set AUTH_TOKEN (openssl rand -hex 32)
+docker compose up -d --build  # build the image and start the service
+docker compose ps             # verify the container reports healthy
+```
+
+Equivalent operations through the provided Makefile:
+
+```bash
+make up        # validate .env, then docker compose up -d --build
+make logs      # follow server logs
+make backup    # tar.gz snapshot of the server data into ./backups/
+make restore BACKUP=backups/<file>.tar.gz   # interactive, replaces data and restarts
+make test      # run the 42-assertion integration suite
+make down      # stop; the named volume persists
+```
+
+Hardening properties of the containerized configuration: the process runs as
+the unprivileged `node` user (uid 1000) with a read-only root filesystem, a
+tmpfs at `/tmp`, `no-new-privileges`, an init process, and a `HEALTHCHECK`
+probing `/api/health`. The service publishes on the host loopback only
+(`127.0.0.1:8080`); terminate TLS with a reverse proxy as in the bare-metal
+deployment. All environment variables from the table below apply through
+`.env`.
 
 Run the test suite at any time: `node server/test-e2e.mjs` (starts an isolated
 instance on 127.0.0.1:18977 and exercises authentication, upload/download

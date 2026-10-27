@@ -1,0 +1,50 @@
+# Obsidian E2EE Sync — containerized deployment.
+#
+# Usage:
+#   cp .env.example .env          # set AUTH_TOKEN (required)
+#   docker compose up -d          # start; logs: docker compose logs -f
+#   docker compose down           # stop (data volume persists)
+#
+# The service publishes on the host loopback only; terminate TLS with a
+# reverse proxy on the host (see server/nginx.conf.example) before exposing
+# the endpoint beyond the local machine.
+
+services:
+  sync-server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    image: obsidian-e2ee-sync:latest
+    container_name: obsidian-e2ee-sync
+    restart: unless-stopped
+    init: true
+    env_file: .env
+    environment:
+      # Inside the container the server must bind all interfaces; exposure is
+      # controlled exclusively by the host port mapping below.
+      HOST: 0.0.0.0
+      DATA_DIR: /data
+    ports:
+      # Host loopback only. For a reverse proxy on the same host this is
+      # sufficient; change the left side only if the proxy runs elsewhere.
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - sync-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8080/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  sync-data:

@@ -15,6 +15,12 @@ server/*.log
 server/*.tmp
 *.log
 
+# Docker compose secrets (contains AUTH_TOKEN)
+.env
+
+# Local server data backups produced by `make backup`
+backups/
+
 # OS / editor noise
 .DS_Store
 .vscode/
