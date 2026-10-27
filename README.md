@@ -8,7 +8,7 @@ through Obsidian's `requestUrl()` and all cryptography through the Web Crypto AP
 ```
 ┌──────────────┐  AES-256-GCM ciphertext    ┌──────────────────┐  HTTPS (nginx + Let's Encrypt)
 │  Obsidian    │ ─────────────────────────► │  Storage server  │ ◄──────────────────────────────
-│  plugin      │  [salt|iv|ct+tag] only     │  (this repo)     │  receives no keys, no plaintext
+│  plugin      │  [v2|salt|iv|ct+tag] only  │  (this repo)     │  receives no keys, no plaintext
 └──────────────┘                            └──────────────────┘
 ```
 
@@ -24,7 +24,28 @@ upload. The 256-bit key is derived from the user's password via PBKDF2-SHA-256
 (210 000 iterations) over a deterministic per-vault salt (the first 16 bytes of
 SHA-256 of the server-issued `vaultId`). A fresh uniformly random 12-byte IV is
 generated for every single encryption operation; IV reuse under a given key is
-structurally precluded by the implementation.
+structurally precluded by the implementation. Since 0.2.0 every packet is
+versioned (v2) and binds the file's canonical path into the ciphertext as
+AES-GCM additional data — swapping or replaying a ciphertext under a different
+file name fails authentication instead of silently substituting content.
+
+**Malicious-server defenses (0.2.0):**
+
+- *Content substitution / rollback:* every download is SHA-256-verified against
+  the server index before decryption or any local write; a mismatch aborts the
+  pull with an explicit integrity error.
+- *Wrong-password devices:* a reserved verifier entry proves this device derives
+  the same key as the vault's original encryptor *before* anything is pushed —
+  a misconfigured second device can no longer overwrite the store with
+  ciphertext nobody else can decrypt.
+- *Forged tombstones / mass wipes:* an unusual volume of remote-reported
+  deletions in one cycle requires explicit user confirmation; declining keeps
+  the local files and re-uploads them.
+- *CPU exhaustion:* packets carrying a salt other than the vault's own are
+  rejected before the expensive PBKDF2 pass.
+- *Cross-platform path forking:* all paths are canonicalized to Unicode NFC on
+  both client and server, so NFD (iOS/macOS) and NFC (Windows/Linux) spellings
+  of one file share a single entry instead of forking.
 
 **Visible to the server operator:** file paths and names, ciphertext sizes,
 timestamps, and request/device counts. The transport is not metadata-private.
@@ -32,17 +53,17 @@ Deployments whose threat model requires metadata protection need an oblivious
 or padded storage design; this system does not provide one.
 
 **Stored on each client device (in the plugin's `data.json`):** server URL, API
-bearer token, the E2EE password, and the synchronization journal. Client devices
-must be protected accordingly (full-disk encryption, device passcode). The
-password may alternatively be entered per session by leaving it unset between
-runs; automatic synchronization is unavailable until it is provided.
+bearer token, and the synchronization journal. The E2EE password is stored
+there too by default, but can be switched to session-only memory ("Keep the
+E2EE password on this device" toggle) — it is then never written to disk and
+re-asked after each app restart. Client devices must be protected accordingly
+(full-disk encryption, device passcode).
 
-**Residual server-side capabilities:** deletion or corruption of ciphertext
-(detected: SHA-256 hash verification rejects both upload and consumption of
-mismatched data), denial of service, and rollback of a file's ciphertext to a
-previous authentic version. Rollback is surfaced to the user: the three-way
-reconciliation treats it as a remote modification and resolves it through the
-standard merge/conflict path rather than silently overwriting local state.
+**Residual server-side capabilities:** denial of service, and a *full-state*
+rollback (serving a consistent old index plus old ciphertexts together), which
+is inherent to any unversioned store and is surfaced to the user through the
+three-way reconciliation as a remote modification rather than silently
+overwriting local state.
 
 ## Repository layout
 
@@ -57,7 +78,7 @@ plugin/          Obsidian plugin (TypeScript)
   src/util.ts        helpers (error messages, URL validation)
 server/          Zero-dependency Node.js REST API (Node >= 18)
   server.js          storage service implementation
-  test-e2e.mjs       42-assertion integration test (spawns the server, exercises crypto + REST)
+  test-e2e.mjs       51-assertion integration test (spawns the server, exercises crypto + REST)
   Dockerfile         container image (unprivileged node user, healthcheck)
   nginx.conf.example reverse proxy with TLS
   obsidian-e2ee-sync.service  hardened systemd unit
@@ -131,7 +152,7 @@ make up        # validate .env, then docker compose up -d --build
 make logs      # follow server logs
 make backup    # tar.gz snapshot of the server data into ./backups/
 make restore BACKUP=backups/<file>.tar.gz   # interactive, replaces data and restarts
-make test      # run the 42-assertion integration suite
+make test      # run the 51-assertion integration suite
 make down      # stop; the named volume persists
 ```
 

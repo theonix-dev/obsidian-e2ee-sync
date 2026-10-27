@@ -17,7 +17,11 @@
  *   GET    /api/health                -> unauthenticated liveness probe
  *
  * All /api/* routes except /health require `Authorization: Bearer <AUTH_TOKEN>`
- * and are compared in constant time.
+ * and are compared in constant time. Path mutations (upload/delete) are
+ * serialized per path so the on-disk blob and the index can never disagree,
+ * and every stored path is canonicalized to Unicode NFC (clients on iOS/macOS
+ * produce NFD filenames; without a single canonical form the same logical file
+ * would fork into two independent entries).
  *
  * Configuration (environment variables):
  *   AUTH_TOKEN          required, >= 16 chars   bearer token clients must present
@@ -44,6 +48,9 @@ const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data
 const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
 const MAX_BODY_BYTES = Number(process.env.MAX_BODY_BYTES || 256 * 1024 * 1024);
 const TOMBSTONE_TTL_DAYS = Number(process.env.TOMBSTONE_TTL_DAYS || 0);
+/** Farthest future a client-supplied mtime may claim (guards the clients'
+ *  first-sync "newest mtime wins" heuristic against skewed device clocks). */
+const MAX_MTIME_SKEW_MS = 24 * 3600 * 1000;
 
 if (!AUTH_TOKEN || AUTH_TOKEN.length < 16) {
   console.error(
@@ -72,6 +79,19 @@ function isAuthorized(req) {
   return digest.length === TOKEN_DIGEST.length && crypto.timingSafeEqual(digest, TOKEN_DIGEST);
 }
 
+/** Throttle repeated auth failures per source address (memory-bounded). */
+const authFailures = new Map(); // ip -> { count, resetAt }
+function isAuthThrottled(ip) {
+  const now = Date.now();
+  let entry = authFailures.get(ip);
+  if (!entry || now > entry.resetAt) {
+    if (authFailures.size > 10_000) authFailures.clear();
+    entry = { count: 0, resetAt: now + 60_000 };
+    authFailures.set(ip, entry);
+  }
+  return ++entry.count > 20;
+}
+
 // ---------------------------------------------------------------- helpers ---
 
 class HttpError extends Error {
@@ -92,12 +112,15 @@ function sendJson(res, statusCode, payload) {
 }
 
 /**
- * Normalize a client-supplied vault path to a safe relative path.
- * Returns null for anything suspicious (traversal, absolute paths, control
- * characters, Windows-reserved characters, over-long segments).
+ * Normalize a client-supplied vault path to a safe, canonical relative path.
+ * Returns null for anything suspicious (absolute paths, traversal, control
+ * characters, Windows-reserved characters, over-long segments). The result is
+ * Unicode-NFC normalized so that NFD (iOS/macOS) and NFC (Windows/Linux)
+ * spellings of the same filename share one storage entry.
  */
 function sanitizePath(raw) {
   if (typeof raw !== 'string' || raw.length === 0 || raw.length > 4096) return null;
+  if (raw.startsWith('/')) return null; // absolute — reject, never re-anchor
   if (raw.includes('\\') || raw.includes('\0')) return null;
   const segments = raw.split('/').filter((s) => s.length > 0);
   if (segments.length === 0) return null;
@@ -106,7 +129,7 @@ function sanitizePath(raw) {
     if (segment.length > 255) return null;
     if (/[<>:"|?*\u0000-\u001f]/.test(segment)) return null;
   }
-  return segments.join('/');
+  return segments.join('/').normalize('NFC');
 }
 
 /** Decode a URL-encoded path coming from a header or query parameter. */
@@ -143,6 +166,39 @@ function persistJson(filePath, data) {
 const persistMeta = () => persistJson(META_PATH, meta);
 const persistIndex = () => persistJson(INDEX_PATH, Object.fromEntries(index));
 
+/**
+ * Per-path mutation lock: the sequence [rename/unlink on disk] + [index.set]
+ * must be atomic with respect to other requests for the same path, otherwise
+ * two racing uploads can leave the disk holding one client's bytes while the
+ * index describes the other's hash.
+ */
+const pathLocks = new Map();
+function withPathLock(key, fn) {
+  const prev = pathLocks.get(key) ?? Promise.resolve();
+  const next = prev.then(fn);
+  const guarded = next.catch(() => {});
+  pathLocks.set(key, guarded);
+  guarded.then(() => {
+    if (pathLocks.get(key) === guarded) pathLocks.delete(key);
+  });
+  return next;
+}
+
+/** Remove upload/persist temp files left behind by crashed requests. */
+async function cleanupTmpFiles() {
+  let names;
+  try {
+    names = await fsp.readdir(DATA_DIR);
+  } catch {
+    return;
+  }
+  await Promise.all(
+    names
+      .filter((n) => n.endsWith('.tmp'))
+      .map((n) => fsp.unlink(path.join(DATA_DIR, n)).catch(() => {})),
+  );
+}
+
 async function loadState() {
   await fsp.mkdir(FILES_DIR, { recursive: true, mode: 0o700 });
 
@@ -160,7 +216,7 @@ async function loadState() {
     const raw = JSON.parse(await fsp.readFile(INDEX_PATH, 'utf8'));
     for (const [filePath, entry] of Object.entries(raw || {})) {
       if (typeof filePath === 'string' && entry && typeof entry === 'object') {
-        index.set(filePath, {
+        index.set(filePath.normalize('NFC'), {
           mtime: Number(entry.mtime) || 0,
           size: Number(entry.size) || 0,
           hash: String(entry.hash || ''),
@@ -243,17 +299,21 @@ async function handleUpload(req, res, url) {
     throw new HttpError(400, 'Cipher hash mismatch — upload corrupted in transit?');
   }
 
-  await fsp.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
-  await fsp.rename(tmp, target); // atomic publish
-
   const entry = {
-    mtime: Number.isFinite(clientMtime) && clientMtime > 0 ? clientMtime : Date.now(),
+    mtime:
+      Number.isFinite(clientMtime) && clientMtime > 0
+        ? Math.min(clientMtime, Date.now() + MAX_MTIME_SKEW_MS)
+        : Date.now(),
     size,
     hash,
     deleted: false, // uploading clears any tombstone
   };
-  index.set(clientPath, entry);
-  persistIndex();
+  await withPathLock(clientPath, async () => {
+    await fsp.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
+    await fsp.rename(tmp, target); // atomic publish
+    index.set(clientPath, entry);
+    persistIndex();
+  });
   sendJson(res, 200, { path: clientPath, ...entry });
 }
 
@@ -269,10 +329,13 @@ async function handleDownload(req, res, url) {
   const target = path.join(FILES_DIR, ...clientPath.split('/'));
   let stat;
   try {
-    stat = await fsp.stat(target);
+    // lstat, not stat: a symlink planted inside the files dir must never be
+    // followed out of the storage jail.
+    stat = await fsp.lstat(target);
   } catch {
     throw new HttpError(404, 'File not found.');
   }
+  if (!stat.isFile()) throw new HttpError(404, 'File not found.');
 
   res.writeHead(200, {
     'Content-Type': 'application/octet-stream',
@@ -296,16 +359,18 @@ async function handleDelete(req, res, url) {
 
   if (!entry.deleted) {
     const target = path.join(FILES_DIR, ...clientPath.split('/'));
-    try {
-      await fsp.unlink(target);
-    } catch (err) {
-      if (err.code !== 'ENOENT') throw err;
-    }
     // Tombstone: keep the path in the index so every other device learns about
     // the deletion; mtime becomes the deletion time.
     const tombstone = { mtime: Date.now(), size: 0, hash: '', deleted: true };
-    index.set(clientPath, tombstone);
-    persistIndex();
+    await withPathLock(clientPath, async () => {
+      try {
+        await fsp.unlink(target);
+      } catch (err) {
+        if (err.code !== 'ENOENT') throw err;
+      }
+      index.set(clientPath, tombstone);
+      persistIndex();
+    });
     sendJson(res, 200, { path: clientPath, ...tombstone });
     return;
   }
@@ -343,6 +408,9 @@ const server = http.createServer((req, res) => {
     }
 
     if (!isAuthorized(req)) {
+      if (isAuthThrottled(req.socket.remoteAddress || 'unknown')) {
+        return sendJson(res, 429, { error: 'Too many failed attempts — slow down.' });
+      }
       return sendJson(res, 401, { error: 'Unauthorized' });
     }
 
@@ -368,12 +436,16 @@ const server = http.createServer((req, res) => {
   });
 });
 
-server.headersTimeout = 60_000;
-server.requestTimeout = 0; // long uploads: governed by MAX_BODY_BYTES, not a timer
+server.headersTimeout = 70_000;
+server.keepAliveTimeout = 65_000;
+// Bound the total lifetime of a request: 30 min is ample for a 256 MiB body on
+// a slow uplink (~150 KB/s) while preventing indefinite socket squatting.
+server.requestTimeout = 30 * 60_000;
 
 // ------------------------------------------------------------------ main ----
 
 async function main() {
+  await cleanupTmpFiles();
   await loadState();
   if (TOMBSTONE_TTL_DAYS > 0) {
     gcTombstones();

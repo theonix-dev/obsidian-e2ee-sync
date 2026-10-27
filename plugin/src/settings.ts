@@ -62,6 +62,17 @@ export class E2eeSyncSettingTab extends PluginSettingTab {
             },
           },
           {
+            name: 'Keep the E2EE password on this device',
+            desc:
+              'When on (default), the password is stored in this plugin\u2019s data.json inside your vault. ' +
+              'Turn it off if the vault is backed up to a cloud you do not fully trust: the password is then ' +
+              'kept in memory only and re-asked after each app restart. The API token remains stored either way.',
+            control: {
+              type: 'toggle',
+              key: 'rememberEncryptionPassword',
+            },
+          },
+          {
             name: 'Auto-sync interval (minutes)',
             desc: 'Sync automatically every N minutes (1–1440). 0 disables periodic sync.',
             control: {
@@ -109,13 +120,40 @@ export class E2eeSyncSettingTab extends PluginSettingTab {
   }
 
   async setControlValue(key: string, value: unknown): Promise<void> {
-    (this.plugin.settings as unknown as Record<string, unknown>)[key] = value;
-    await this.plugin.saveSettings();
+    const plugin = this.plugin;
+
+    // The E2EE password may live in memory only (session-only mode).
+    if (key === 'encryptionPassword') {
+      const password = String(value ?? '');
+      if (plugin.settings.rememberEncryptionPassword) {
+        plugin.settings.encryptionPassword = password;
+      } else {
+        plugin.sessionPassword = password;
+        plugin.settings.encryptionPassword = ''; // never persisted
+      }
+      await plugin.onEncryptionPasswordChanged();
+      return;
+    }
+
+    if (key === 'rememberEncryptionPassword') {
+      const remember = Boolean(value);
+      if (remember) {
+        // Persist what is currently in memory.
+        plugin.settings.encryptionPassword = plugin.sessionPassword;
+      } else {
+        // Move the persisted password into memory and blank the stored copy.
+        plugin.sessionPassword = plugin.settings.encryptionPassword;
+        plugin.settings.encryptionPassword = '';
+      }
+      plugin.settings.rememberEncryptionPassword = remember;
+      await plugin.saveSettings();
+      return;
+    }
+
+    (plugin.settings as unknown as Record<string, unknown>)[key] = value;
+    await plugin.saveSettings();
     if (key === 'autoSyncMinutes') {
       this.plugin.setAutoSync(Number(value) || 0);
-    }
-    if (key === 'encryptionPassword') {
-      await this.plugin.onEncryptionPasswordChanged();
     }
   }
 

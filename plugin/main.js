@@ -67,7 +67,7 @@ var SyncApi = class {
       throw new ApiError(`"${url}" is not a valid URL (include https://).`, 0);
     }
     const host = parsed.hostname;
-    const isLocal = host === "localhost" || host === "127.0.0.1" || host === "[::1]" || host.endsWith(".local");
+    const isLocal = host === "localhost" || host === "127.0.0.1" || host === "[::1]";
     if (parsed.protocol !== "https:" && !isLocal) {
       throw new ApiError(
         "HTTPS is required for remote sync servers \u2014 refusing to send the API token over cleartext.",
@@ -183,7 +183,9 @@ var SyncApi = class {
   /** Settings-tab helper: verifies auth + reachability, returns live file count. */
   async testConnection() {
     const [meta, index] = await Promise.all([this.getMeta(), this.getIndex()]);
-    const live = Object.values(index.files).filter((f) => f && !f.deleted).length;
+    const live = Object.entries(index.files).filter(
+      ([p, f]) => f && !f.deleted && !p.startsWith(".e2ee-sync-")
+    ).length;
     return { fileCount: live, vaultId: meta.vaultId };
   }
 };
@@ -192,7 +194,9 @@ var SyncApi = class {
 var PBKDF2_ITERATIONS = 21e4;
 var SALT_BYTES = 16;
 var IV_BYTES = 12;
-var MIN_PACKET_BYTES = SALT_BYTES + IV_BYTES + 16;
+var PACKET_V1_BYTES = SALT_BYTES + IV_BYTES + 16;
+var PACKET_V2 = 2;
+var PACKET_V2_BYTES = 1 + SALT_BYTES + IV_BYTES + 16;
 var PACKET_HEADER_BYTES = SALT_BYTES + IV_BYTES;
 var CryptoError = class extends Error {
   constructor(message) {
@@ -210,6 +214,19 @@ function subtle() {
 function copyBuffer(view) {
   return view.slice().buffer;
 }
+function aadBuffer(path) {
+  const p = new TextEncoder().encode(path.normalize("NFC"));
+  const aad = new Uint8Array(1 + p.length);
+  aad[0] = PACKET_V2;
+  aad.set(p, 1);
+  return aad.buffer;
+}
+function bytesEqual(a, b) {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+  return diff === 0;
+}
 function toHex(bytes) {
   const digits = "0123456789abcdef";
   let out = "";
@@ -219,7 +236,7 @@ function toHex(bytes) {
   return out;
 }
 async function sha256Hex(data) {
-  const input = data instanceof Uint8Array ? copyBuffer(data) : data;
+  const input = data instanceof Uint8Array ? data : new Uint8Array(data);
   const digest = await subtle().digest("SHA-256", input);
   return toHex(new Uint8Array(digest));
 }
@@ -251,35 +268,55 @@ async function saltFromVaultId(vaultId) {
   );
   return new Uint8Array(digest).slice(0, SALT_BYTES);
 }
-async function encryptBuffer(plaintext, key, salt) {
+async function encryptBuffer(plaintext, key, salt, path) {
   if (salt.length !== SALT_BYTES) {
     throw new CryptoError(`Salt must be exactly ${SALT_BYTES} bytes.`);
   }
   const iv = window.crypto.getRandomValues(new Uint8Array(IV_BYTES));
   const ciphertext = new Uint8Array(
-    await subtle().encrypt({ name: "AES-GCM", iv }, key, plaintext)
+    await subtle().encrypt(
+      { name: "AES-GCM", iv, additionalData: aadBuffer(path) },
+      key,
+      plaintext
+    )
   );
-  const packet = new Uint8Array(SALT_BYTES + IV_BYTES + ciphertext.length);
-  packet.set(salt, 0);
-  packet.set(iv, SALT_BYTES);
-  packet.set(ciphertext, SALT_BYTES + IV_BYTES);
+  const packet = new Uint8Array(1 + SALT_BYTES + IV_BYTES + ciphertext.length);
+  packet[0] = PACKET_V2;
+  packet.set(salt, 1);
+  packet.set(iv, 1 + SALT_BYTES);
+  packet.set(ciphertext, 1 + SALT_BYTES + IV_BYTES);
   return packet.buffer;
 }
-async function decryptBuffer(packet, keyForSalt) {
-  if (packet.byteLength < MIN_PACKET_BYTES) {
+async function decryptAttempt(bytes, offset, keyForSalt, aad) {
+  const salt = bytes.slice(offset, offset + SALT_BYTES);
+  const iv = copyBuffer(bytes.slice(offset + SALT_BYTES, offset + SALT_BYTES + IV_BYTES));
+  const ciphertext = copyBuffer(bytes.slice(offset + SALT_BYTES + IV_BYTES));
+  const key = await keyForSalt(salt);
+  const algorithm = aad ? { name: "AES-GCM", iv, additionalData: aad } : { name: "AES-GCM", iv };
+  return subtle().decrypt(algorithm, key, ciphertext);
+}
+async function decryptBuffer(packet, keyForSalt, path) {
+  const bytes = new Uint8Array(packet);
+  if (bytes.length < PACKET_V1_BYTES) {
     throw new CryptoError("Encrypted packet is truncated or corrupt.");
   }
-  const bytes = new Uint8Array(packet);
-  const salt = bytes.slice(0, SALT_BYTES);
-  const iv = bytes.slice(SALT_BYTES, SALT_BYTES + IV_BYTES);
-  const ciphertext = bytes.slice(SALT_BYTES + IV_BYTES);
-  const key = await keyForSalt(salt);
+  const additionalData = aadBuffer(path);
+  if (bytes.length >= PACKET_V2_BYTES && bytes[0] === PACKET_V2) {
+    try {
+      return await decryptAttempt(bytes, 1, keyForSalt, additionalData);
+    } catch (err) {
+      if (err instanceof CryptoError) throw err;
+      try {
+        return await decryptAttempt(bytes, 0, keyForSalt, null);
+      } catch (e) {
+        throw new CryptoError(
+          "Decryption failed \u2014 wrong E2EE password, corrupted file, or ciphertext not created for this path."
+        );
+      }
+    }
+  }
   try {
-    return await subtle().decrypt(
-      { name: "AES-GCM", iv: copyBuffer(iv) },
-      key,
-      copyBuffer(ciphertext)
-    );
+    return await decryptAttempt(bytes, 0, keyForSalt, null);
   } catch (e) {
     throw new CryptoError(
       "Decryption failed \u2014 wrong E2EE password or corrupted file."
@@ -287,11 +324,15 @@ async function decryptBuffer(packet, keyForSalt) {
   }
 }
 var CryptoManager = class {
-  constructor(password) {
+  constructor(password, expectedSalt = null) {
     this.password = password;
+    this.expectedSalt = expectedSalt;
     this.cache = /* @__PURE__ */ new Map();
   }
   async keyForSalt(salt) {
+    if (this.expectedSalt && !bytesEqual(salt, this.expectedSalt)) {
+      throw new CryptoError("Packet salt does not belong to this vault.");
+    }
     const id = toHex(salt);
     let key = this.cache.get(id);
     if (!key) {
@@ -300,11 +341,11 @@ var CryptoManager = class {
     }
     return key;
   }
-  async encrypt(plaintext, salt) {
-    return encryptBuffer(plaintext, await this.keyForSalt(salt), salt);
+  async encrypt(plaintext, salt, path) {
+    return encryptBuffer(plaintext, await this.keyForSalt(salt), salt, path);
   }
-  async decrypt(packet) {
-    return decryptBuffer(packet, (salt) => this.keyForSalt(salt));
+  async decrypt(packet, path) {
+    return decryptBuffer(packet, (salt) => this.keyForSalt(salt), path);
   }
 };
 
@@ -319,7 +360,7 @@ function errorMessage(error) {
   }
 }
 function isLocalHost(hostname) {
-  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]" || hostname.endsWith(".local");
+  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
 }
 function validateServerUrl(url) {
   const trimmed = url.trim();
@@ -343,8 +384,18 @@ function validateServerUrl(url) {
 var DEBOUNCE_MS = 2500;
 var IGNORE_WINDOW_MS = 500;
 var JOURNAL_FLUSH_EVERY = 20;
+var VERIFIER_PATH = ".e2ee-sync-verifier.v1";
+var VERIFIER_PLAINTEXT = new TextEncoder().encode("e2ee-verifier-v1\0");
+var MAX_SYNCABLE_BYTES = 256 * 1024 * 1024;
 var EXCLUDED_PREFIXES = [".trash/"];
+var EXCLUDED_NAMES = /* @__PURE__ */ new Set([".DS_Store", "Thumbs.db", "desktop.ini"]);
+function canonicalPath(p) {
+  return (0, import_obsidian2.normalizePath)(p).normalize("NFC");
+}
 function isSyncablePath(p, configDir) {
+  if (p === VERIFIER_PATH) return false;
+  const name = p.slice(p.lastIndexOf("/") + 1);
+  if (EXCLUDED_NAMES.has(name)) return false;
   const prefixes = [`${configDir.replace(/\/+$/, "")}/`, ...EXCLUDED_PREFIXES];
   for (const prefix of prefixes) {
     if (p === prefix.slice(0, -1) || p.startsWith(prefix)) return false;
@@ -360,9 +411,9 @@ var SyncEngine = class {
     this.cryptoPassword = "";
     this.vaultId = "";
     this.salt = null;
-    /** Paths we are writing ourselves; vault events for them are ignored. */
+    /** Canonical paths we are writing ourselves; vault events for them are ignored. */
     this.ignorePaths = /* @__PURE__ */ new Set();
-    /** Per-path debounce timers, keyed by path. */
+    /** Per-path debounce timers, keyed by canonical path. */
     this.debounces = /* @__PURE__ */ new Map();
     /** All pending raw timer ids so dispose() can clear everything. */
     this.pendingTimers = /* @__PURE__ */ new Set();
@@ -400,12 +451,13 @@ var SyncEngine = class {
    * logic handles both halves naturally, so we just schedule a sync run.
    */
   onLocalRenamed(oldPath, newPath) {
-    const oldSyncable = isSyncablePath(oldPath, this.configDir);
-    const newSyncable = isSyncablePath(newPath, this.configDir);
+    const oldSyncable = isSyncablePath(canonicalPath(oldPath), this.configDir);
+    const newSyncable = isSyncablePath(canonicalPath(newPath), this.configDir);
     if (oldSyncable) this.onLocalTouched(oldPath);
     if (newSyncable) this.onLocalTouched(newPath);
   }
-  onLocalTouched(path) {
+  onLocalTouched(rawPath) {
+    const path = canonicalPath(rawPath);
     if (!isSyncablePath(path, this.configDir) || this.ignorePaths.has(path)) return;
     const existing = this.debounces.get(path);
     if (existing !== void 0) window.clearTimeout(existing);
@@ -444,10 +496,18 @@ var SyncEngine = class {
       const setup = await this.ensureSetup();
       this.ctx.setStatus("syncing");
       const remoteIndex = await setup.api.getIndex();
-      const remote = (_a = remoteIndex.files) != null ? _a : {};
+      const remote = this.canonicalizeRemote((_a = remoteIndex.files) != null ? _a : {});
       const locals = this.collectLocalFiles();
       const journal = this.ctx.getJournal();
       const plan = this.planSync(locals, remote, journal);
+      const deletes = plan.filter((op) => op.action === "delete-local");
+      if (deletes.length > 0 && deletes.length >= this.massDeleteThreshold(locals.size) && this.ctx.confirmMassDeletion && !await this.ctx.confirmMassDeletion(deletes.length, locals.size)) {
+        for (const op of deletes) op.action = "forget";
+        this.ctx.notify(
+          `E2EE Sync: refused ${deletes.length} remote deletion(s) without confirmation \u2014 the local files were kept and will be re-uploaded. Verify the server before syncing again.`,
+          15e3
+        );
+      }
       const summary = await this.executePlan(plan, setup);
       await this.flushJournal(true);
       this.ctx.setStatus(
@@ -482,10 +542,29 @@ var SyncEngine = class {
     }
   }
   // ------------------------------------------------------------- planning
+  /**
+   * Fold the raw index into a canonical-key map. When an NFD and an NFC
+   * spelling of the same path both exist (pre-normalization 0.1.x data), the
+   * live entry wins over a tombstone; API operations keep using the raw key.
+   */
+  canonicalizeRemote(files) {
+    const remote = /* @__PURE__ */ new Map();
+    for (const [key, info] of Object.entries(files)) {
+      if (!info) continue;
+      const canon = canonicalPath(key);
+      const prev = remote.get(canon);
+      if (!prev || prev.info.deleted && !info.deleted) {
+        remote.set(canon, { key, info });
+      }
+    }
+    return remote;
+  }
   collectLocalFiles() {
     const out = /* @__PURE__ */ new Map();
     for (const file of this.ctx.app.vault.getFiles()) {
-      if (isSyncablePath(file.path, this.configDir)) out.set(file.path, file);
+      const path = canonicalPath(file.path);
+      if (!isSyncablePath(path, this.configDir)) continue;
+      if (!out.has(path)) out.set(path, file);
     }
     return out;
   }
@@ -494,35 +573,37 @@ var SyncEngine = class {
     const paths = /* @__PURE__ */ new Set([
       ...locals.keys(),
       ...Object.keys(journal),
-      ...Object.keys(remote)
+      ...remote.keys()
     ]);
     const ops = [];
     for (const path of paths) {
       if (!isSyncablePath(path, this.configDir)) continue;
       const local = locals.get(path);
       const record = journal[path];
-      const rem = remote[path];
+      const entry = remote.get(path);
+      const rem = entry == null ? void 0 : entry.info;
+      const remoteKey = entry == null ? void 0 : entry.key;
       if (rem && !rem.deleted) {
         const remoteChanged = !record || rem.hash !== record.remoteHash;
         if (local) {
           const localChanged = !record || local.stat.mtime > record.localMtime;
           if (localChanged && remoteChanged) {
             if (record) {
-              ops.push({ action: "conflict", path, local, remote: rem });
+              ops.push({ action: "conflict", path, local, remote: rem, remoteKey });
             } else if (rem.mtime >= local.stat.mtime) {
-              ops.push({ action: "pull", path, local, remote: rem });
+              ops.push({ action: "pull", path, local, remote: rem, remoteKey });
             } else {
-              ops.push({ action: "push", path, local, remote: rem });
+              ops.push({ action: "push", path, local });
             }
           } else if (localChanged) {
             ops.push({ action: "push", path, local });
           } else if (remoteChanged) {
-            ops.push({ action: "pull", path, local, remote: rem });
+            ops.push({ action: "pull", path, local, remote: rem, remoteKey });
           }
         } else if (record && !remoteChanged) {
-          ops.push({ action: "delete-remote", path, remote: rem });
+          ops.push({ action: "delete-remote", path, remote: rem, remoteKey });
         } else {
-          ops.push({ action: "pull", path, remote: rem });
+          ops.push({ action: "pull", path, remote: rem, remoteKey });
         }
       } else {
         if (!local) {
@@ -538,6 +619,13 @@ var SyncEngine = class {
       }
     }
     return ops;
+  }
+  /**
+   * More than this many (or this fraction of) remote deletions in one cycle
+   * requires the user's explicit consent — guards against server-side wipes.
+   */
+  massDeleteThreshold(localCount) {
+    return Math.max(5, Math.floor(localCount * 0.1));
   }
   // ------------------------------------------------------------ execution
   async executePlan(plan, setup) {
@@ -557,7 +645,7 @@ var SyncEngine = class {
             this.markJournalDirty();
             break;
           case "push":
-            await this.doPush(op.path, setup, summary);
+            await this.doPush(op, setup, summary);
             break;
           case "pull":
             await this.doPull(op, setup, summary);
@@ -566,7 +654,7 @@ var SyncEngine = class {
             await this.doConflict(op, setup, summary);
             break;
           case "delete-local":
-            await this.doDeleteLocal(op.path, summary);
+            await this.doDeleteLocal(op, summary);
             break;
           case "delete-remote":
             await this.doDeleteRemote(op, setup, summary);
@@ -586,14 +674,19 @@ var SyncEngine = class {
     return summary;
   }
   /** Read, encrypt and upload one vault file; then update its journal entry. */
-  async doPush(path, setup, summary) {
-    const file = this.ctx.app.vault.getAbstractFileByPath(path);
+  async doPush(op, setup, summary) {
+    const file = this.ctx.app.vault.getAbstractFileByPath(op.local ? op.local.path : op.path);
     if (!(file instanceof import_obsidian2.TFile)) return;
+    if (file.stat.size > MAX_SYNCABLE_BYTES) {
+      throw new Error(
+        `${op.path} is ${Math.round(file.stat.size / 1048576)} MB \u2014 above the sync limit of ${Math.round(MAX_SYNCABLE_BYTES / 1048576)} MB. Sync it manually or raise the limit.`
+      );
+    }
     const plaintext = await this.ctx.app.vault.readBinary(file);
-    const packet = await setup.crypto.encrypt(plaintext, setup.salt);
-    const cipherHash = await sha256Hex(packet);
-    const uploaded = await setup.api.upload(path, packet, file.stat.mtime, cipherHash);
-    this.ctx.setJournalEntry(path, {
+    const packet = await setup.crypto.encrypt(plaintext, setup.salt, op.path);
+    const cipherHash = await sha256Hex(new Uint8Array(packet));
+    const uploaded = await setup.api.upload(op.path, packet, file.stat.mtime, cipherHash);
+    this.ctx.setJournalEntry(op.path, {
       localMtime: file.stat.mtime,
       remoteHash: uploaded && uploaded.hash ? uploaded.hash : cipherHash,
       remoteMtime: uploaded && uploaded.mtime ? uploaded.mtime : Date.now()
@@ -603,11 +696,12 @@ var SyncEngine = class {
   }
   /** Download, decrypt and write one remote file; then update its journal. */
   async doPull(op, setup, summary) {
+    var _a;
     const remote = op.remote;
     if (!remote) throw new Error("Pull planned without remote metadata.");
     let packet;
     try {
-      packet = await setup.api.download(op.path);
+      packet = await setup.api.download((_a = op.remoteKey) != null ? _a : op.path);
     } catch (error) {
       if (error instanceof ApiError && error.status === 404) {
         this.ctx.setJournalEntry(op.path, null);
@@ -616,8 +710,14 @@ var SyncEngine = class {
       }
       throw error;
     }
-    const plaintext = await setup.crypto.decrypt(packet);
-    const existing = this.ctx.app.vault.getAbstractFileByPath(op.path);
+    const actualHash = await sha256Hex(new Uint8Array(packet));
+    if (actualHash !== remote.hash) {
+      throw new Error(
+        `Integrity check failed: downloaded bytes do not match the server index (rollback or corruption) \u2014 refusing to overwrite ${op.path}.`
+      );
+    }
+    const plaintext = await setup.crypto.decrypt(packet, op.path);
+    const existing = this.ctx.app.vault.getAbstractFileByPath(op.local ? op.local.path : op.path);
     if (existing && !(existing instanceof import_obsidian2.TFile)) {
       throw new Error(`Local path exists but is a folder: ${op.path}`);
     }
@@ -643,16 +743,20 @@ var SyncEngine = class {
     summary.pulled++;
   }
   /**
-   * "Keep both" conflict resolution:
-   *  1. copy the local version to <name>_conflict_<timestamp>.<ext> and push
-   *     that copy immediately (it must not depend on a later sync cycle),
-   *  2. download the remote version into the original path.
+   * "Keep both" conflict resolution — ordered so a failure never leaves
+   * duplicate debris and a retry is idempotent:
+   *  1. upload the local version to <name>_conflict_<timestamp>.<ext> FIRST,
+   *  2. only then create the local copy of it and journal it,
+   *  3. download the remote version into the original path.
    */
   async doConflict(op, setup, summary) {
     const local = op.local;
     if (!local) return;
     const conflictPath = this.uniqueConflictPath(op.path);
     const localCopy = await this.ctx.app.vault.readBinary(local);
+    const packet = await setup.crypto.encrypt(localCopy, setup.salt, conflictPath);
+    const cipherHash = await sha256Hex(new Uint8Array(packet));
+    const uploaded = await setup.api.upload(conflictPath, packet, local.stat.mtime, cipherHash);
     this.beginIgnore(conflictPath);
     try {
       await this.ctx.app.vault.createBinary(conflictPath, localCopy);
@@ -660,8 +764,14 @@ var SyncEngine = class {
       this.ignorePaths.delete(conflictPath);
       throw error;
     }
-    await this.doPush(conflictPath, setup, summary);
-    await this.doPull({ ...op, local: void 0 }, setup, summary);
+    const written = this.ctx.app.vault.getAbstractFileByPath(conflictPath);
+    this.ctx.setJournalEntry(conflictPath, {
+      localMtime: written instanceof import_obsidian2.TFile ? written.stat.mtime : local.stat.mtime,
+      remoteHash: uploaded && uploaded.hash ? uploaded.hash : cipherHash,
+      remoteMtime: uploaded && uploaded.mtime ? uploaded.mtime : Date.now()
+    });
+    this.markJournalDirty();
+    await this.doPull({ ...op, local: void 0, remoteKey: op.remoteKey }, setup, summary);
     summary.conflicts++;
     this.ctx.notify(
       `Conflict detected in file: ${op.path}
@@ -669,24 +779,25 @@ Both versions kept \u2014 local copy saved as: ${conflictPath}`,
       1e4
     );
   }
-  async doDeleteLocal(path, summary) {
-    const file = this.ctx.app.vault.getAbstractFileByPath(path);
+  async doDeleteLocal(op, summary) {
+    const file = this.ctx.app.vault.getAbstractFileByPath(op.local ? op.local.path : op.path);
     if (file instanceof import_obsidian2.TFile) {
-      this.beginIgnore(path);
+      this.beginIgnore(op.path);
       try {
         await this.ctx.app.vault.trash(file, true);
       } catch (error) {
-        this.ignorePaths.delete(path);
+        this.ignorePaths.delete(op.path);
         throw error;
       }
     }
-    this.ctx.setJournalEntry(path, null);
+    this.ctx.setJournalEntry(op.path, null);
     this.markJournalDirty();
     summary.deletedLocal++;
   }
   async doDeleteRemote(op, setup, summary) {
+    var _a;
     try {
-      await setup.api.deleteFile(op.path);
+      await setup.api.deleteFile((_a = op.remoteKey) != null ? _a : op.path);
     } catch (error) {
       if (error instanceof ApiError && error.status === 404) {
       } else {
@@ -707,14 +818,67 @@ Both versions kept \u2014 local copy saved as: ${conflictPath}`,
     }
     const meta = await this.api.getMeta();
     if (!this.crypto || this.cryptoPassword !== settings.encryptionPassword || this.vaultId !== meta.vaultId) {
-      this.salt = await saltFromVaultId(meta.vaultId);
-      this.crypto = new CryptoManager(settings.encryptionPassword);
+      const salt2 = await saltFromVaultId(meta.vaultId);
+      this.salt = salt2;
+      this.crypto = new CryptoManager(settings.encryptionPassword, salt2);
       this.cryptoPassword = settings.encryptionPassword;
       this.vaultId = meta.vaultId;
     }
     const salt = this.salt;
     if (!salt || !this.crypto) throw new Error("Crypto setup failed unexpectedly.");
-    return { api: this.api, crypto: this.crypto, salt };
+    const setup = { api: this.api, crypto: this.crypto, salt };
+    await this.ensurePasswordVerifier(setup);
+    return setup;
+  }
+  /**
+   * Fail-closed key check: refuse to touch vault data unless this device's
+   * password decrypts the vault verifier stored at a reserved server path.
+   * This is what stops a wrongly-configured second device from overwriting
+   * the whole store with ciphertext nobody else can decrypt. A verifier
+   * mis-seeded onto an otherwise EMPTY server may be re-created; on a
+   * non-empty vault a mismatch is fatal.
+   */
+  async ensurePasswordVerifier(setup) {
+    let packet = null;
+    try {
+      packet = await setup.api.download(VERIFIER_PATH);
+    } catch (error) {
+      if (!(error instanceof ApiError) || error.status !== 404) throw error;
+    }
+    if (packet) {
+      let matches = false;
+      try {
+        const plain = new Uint8Array(await setup.crypto.decrypt(packet, VERIFIER_PATH));
+        matches = plain.length === VERIFIER_PLAINTEXT.length && bytesEqual(plain, VERIFIER_PLAINTEXT);
+      } catch (error) {
+        if (error instanceof CryptoError) {
+          matches = false;
+        } else {
+          throw error;
+        }
+      }
+      if (matches) return;
+      const index = await setup.api.getIndex();
+      const liveFiles = Object.entries(index.files).filter(
+        ([p, f]) => canonicalPath(p) !== VERIFIER_PATH && f && !f.deleted
+      ).length;
+      if (liveFiles > 0) {
+        throw new CryptoError(
+          "Wrong E2EE password for this vault (verifier check failed). Correct it in the plugin settings before syncing \u2014 nothing was changed on the server."
+        );
+      }
+    }
+    const seeded = await setup.crypto.encrypt(
+      VERIFIER_PLAINTEXT.buffer,
+      setup.salt,
+      VERIFIER_PATH
+    );
+    await setup.api.upload(
+      VERIFIER_PATH,
+      seeded,
+      Date.now(),
+      await sha256Hex(new Uint8Array(seeded))
+    );
   }
   beginIgnore(path) {
     this.ignorePaths.add(path);
@@ -822,6 +986,14 @@ var E2eeSyncSettingTab = class extends import_obsidian3.PluginSettingTab {
             }
           },
           {
+            name: "Keep the E2EE password on this device",
+            desc: "When on (default), the password is stored in this plugin\u2019s data.json inside your vault. Turn it off if the vault is backed up to a cloud you do not fully trust: the password is then kept in memory only and re-asked after each app restart. The API token remains stored either way.",
+            control: {
+              type: "toggle",
+              key: "rememberEncryptionPassword"
+            }
+          },
+          {
             name: "Auto-sync interval (minutes)",
             desc: "Sync automatically every N minutes (1\u20131440). 0 disables periodic sync.",
             control: {
@@ -864,13 +1036,34 @@ var E2eeSyncSettingTab = class extends import_obsidian3.PluginSettingTab {
     return this.plugin.settings[key];
   }
   async setControlValue(key, value) {
-    this.plugin.settings[key] = value;
-    await this.plugin.saveSettings();
+    const plugin = this.plugin;
+    if (key === "encryptionPassword") {
+      const password = String(value != null ? value : "");
+      if (plugin.settings.rememberEncryptionPassword) {
+        plugin.settings.encryptionPassword = password;
+      } else {
+        plugin.sessionPassword = password;
+        plugin.settings.encryptionPassword = "";
+      }
+      await plugin.onEncryptionPasswordChanged();
+      return;
+    }
+    if (key === "rememberEncryptionPassword") {
+      const remember = Boolean(value);
+      if (remember) {
+        plugin.settings.encryptionPassword = plugin.sessionPassword;
+      } else {
+        plugin.sessionPassword = plugin.settings.encryptionPassword;
+        plugin.settings.encryptionPassword = "";
+      }
+      plugin.settings.rememberEncryptionPassword = remember;
+      await plugin.saveSettings();
+      return;
+    }
+    plugin.settings[key] = value;
+    await plugin.saveSettings();
     if (key === "autoSyncMinutes") {
       this.plugin.setAutoSync(Number(value) || 0);
-    }
-    if (key === "encryptionPassword") {
-      await this.plugin.onEncryptionPasswordChanged();
     }
   }
   async runConnectionTest() {
@@ -899,30 +1092,120 @@ var DEFAULT_SETTINGS = {
   serverUrl: "",
   apiToken: "",
   encryptionPassword: "",
-  autoSyncMinutes: 5
+  autoSyncMinutes: 5,
+  rememberEncryptionPassword: true
 };
 
 // src/main.ts
 var STARTUP_SYNC_DELAY_MS = 4e3;
+function confirmDialog(app, title, body, confirmText) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const settle = (value) => {
+      if (!settled) {
+        settled = true;
+        resolve(value);
+      }
+    };
+    new class extends import_obsidian4.Modal {
+      constructor() {
+        super(app);
+      }
+      onOpen() {
+        this.titleEl.setText(title);
+        this.contentEl.createEl("p", { text: body });
+        const row = this.contentEl.createDiv({ cls: "modal-button-container" });
+        const cancel = row.createEl("button", { text: "Cancel" });
+        const confirm = row.createEl("button", { text: confirmText, cls: "mod-cta" });
+        cancel.onclick = () => {
+          settle(false);
+          this.close();
+        };
+        confirm.onclick = () => {
+          settle(true);
+          this.close();
+        };
+      }
+      onClose() {
+        settle(false);
+        super.onClose();
+      }
+    }().open();
+  });
+}
+var PasswordPromptModal = class extends import_obsidian4.Modal {
+  constructor(app, onSubmit) {
+    super(app);
+    this.onSubmit = onSubmit;
+  }
+  onOpen() {
+    let settled = false;
+    const settle = (value) => {
+      if (!settled) {
+        settled = true;
+        this.onSubmit(value);
+      }
+    };
+    this.titleEl.setText("E2EE Sync: E2EE password required");
+    this.contentEl.createEl("p", {
+      text: "This device is configured to keep the E2EE password in memory only. Enter it to unlock sync for this session \u2014 it will not be written to disk."
+    });
+    const input = this.contentEl.createEl("input", { type: "password" });
+    input.placeholder = "E2EE password";
+    const row = this.contentEl.createDiv({ cls: "modal-button-container" });
+    const cancel = row.createEl("button", { text: "Not now" });
+    const unlock = row.createEl("button", { text: "Unlock sync", cls: "mod-cta" });
+    const submit = () => {
+      settle(input.value || null);
+      this.close();
+    };
+    cancel.onclick = () => {
+      settle(null);
+      this.close();
+    };
+    unlock.onclick = submit;
+    input.addEventListener("keydown", (evt) => {
+      if (evt.key === "Enter") submit();
+    });
+    window.setTimeout(() => input.focus(), 50);
+  }
+  onClose() {
+    super.onClose();
+  }
+};
 var E2eeSyncPlugin = class extends import_obsidian4.Plugin {
   constructor() {
     super(...arguments);
     this.settings = { ...DEFAULT_SETTINGS };
     this.journal = {};
+    /** Live password when rememberEncryptionPassword is false (never persisted). */
+    this.sessionPassword = "";
     this.statusBarEl = null;
     this.ribbonEl = null;
     this.autoSyncTimer = null;
     this.oneShotTimers = /* @__PURE__ */ new Set();
     this.lastErrorNotice = "";
   }
+  /** The password in force right now: persisted value or the session value. */
+  get effectivePassword() {
+    return this.settings.rememberEncryptionPassword ? this.settings.encryptionPassword : this.sessionPassword;
+  }
   async onload() {
     var _a, _b, _c;
     const data = (_a = await this.loadData()) != null ? _a : {};
     this.settings = { ...DEFAULT_SETTINGS, ...(_b = data.settings) != null ? _b : {} };
     this.journal = (_c = data.journal) != null ? _c : {};
+    for (const key of Object.keys(this.journal)) {
+      const canonical = canonicalPath(key);
+      if (canonical !== key) {
+        const record = this.journal[key];
+        delete this.journal[key];
+        if (!this.journal[canonical]) this.journal[canonical] = record;
+      }
+    }
     this.engine = new SyncEngine({
       app: this.app,
-      getSettings: () => this.settings,
+      getSettings: () => ({ ...this.settings, encryptionPassword: this.effectivePassword }),
       getJournal: () => this.journal,
       setJournalEntry: (path, record) => {
         if (record) this.journal[path] = record;
@@ -930,7 +1213,13 @@ var E2eeSyncPlugin = class extends import_obsidian4.Plugin {
       },
       persist: () => this.saveData({ settings: this.settings, journal: this.journal }),
       setStatus: (status, message) => this.updateStatus(status, message),
-      notify: (message, timeout) => new import_obsidian4.Notice(message, timeout != null ? timeout : 6e3)
+      notify: (message, timeout) => new import_obsidian4.Notice(message, timeout != null ? timeout : 6e3),
+      confirmMassDeletion: (deletedCount, localCount) => confirmDialog(
+        this.app,
+        "E2EE Sync: mass deletion detected",
+        `The server reports ${deletedCount} of your ${localCount} files as deleted. This can mean another device cleaned the vault \u2014 or that the server (or API token) was compromised. "Keep my local files" cancels these deletions; the kept files are re-uploaded on the next sync, so nothing is lost either way.`,
+        "Delete as instructed"
+      )
     });
     this.addSettingTab(new E2eeSyncSettingTab(this.app, this));
     this.ribbonEl = this.addRibbonIcon("refresh-cw", "E2EE Sync: sync now", () => {
@@ -942,11 +1231,18 @@ var E2eeSyncPlugin = class extends import_obsidian4.Plugin {
       name: "Force full sync",
       callback: () => this.requestManualSync()
     });
+    this.addCommand({
+      id: "enter-session-password",
+      name: "Enter the E2EE password for this session",
+      callback: () => this.promptForSessionPassword()
+    });
     this.app.workspace.onLayoutReady(() => this.onLayoutReady());
     this.updateStatus("idle");
   }
   onunload() {
     var _a;
+    void this.saveData({ settings: this.settings, journal: this.journal }).catch(() => {
+    });
     (_a = this.engine) == null ? void 0 : _a.dispose();
     if (this.autoSyncTimer !== null) window.clearInterval(this.autoSyncTimer);
     for (const t of this.oneShotTimers) window.clearTimeout(t);
@@ -954,12 +1250,19 @@ var E2eeSyncPlugin = class extends import_obsidian4.Plugin {
   }
   // ------------------------------------------------------------- settings
   async saveSettings() {
-    await this.saveData({ settings: this.settings, journal: this.journal });
+    const settings = {
+      ...this.settings,
+      encryptionPassword: this.settings.rememberEncryptionPassword ? this.settings.encryptionPassword : ""
+      // session-only mode: the password never reaches data.json
+    };
+    await this.saveData({ settings, journal: this.journal });
   }
   /**
    * A changed password means every existing journal record is meaningless (the
    * remote ciphertext was produced with a different key). Reset the journal so
    * the next sync re-encrypts and re-uploads everything from this device.
+   * (With the password verifier in place, a genuinely wrong password is
+   * rejected before any upload; this reset only runs for intentional changes.)
    */
   async onEncryptionPasswordChanged() {
     this.engine.invalidateCrypto();
@@ -972,7 +1275,28 @@ var E2eeSyncPlugin = class extends import_obsidian4.Plugin {
   }
   // ------------------------------------------------------------- syncing
   requestManualSync() {
+    if (!this.settings.serverUrl || !this.settings.apiToken) {
+      new import_obsidian4.Notice("E2EE Sync: set the server URL and API token in the plugin settings first.", 6e3);
+      return;
+    }
+    if (!this.effectivePassword) {
+      this.promptForSessionPassword();
+      return;
+    }
     void this.engine.runFullSync();
+  }
+  /** Ask for the password when session-only mode has nothing in memory. */
+  promptForSessionPassword() {
+    if (this.settings.rememberEncryptionPassword || this.sessionPassword) return;
+    new PasswordPromptModal(this.app, (password) => {
+      if (!password) {
+        this.updateStatus("error", "E2EE password not entered (session-only mode)");
+        return;
+      }
+      this.sessionPassword = password;
+      this.setAutoSync(this.settings.autoSyncMinutes);
+      this.engine.requestSync();
+    }).open();
   }
   /** (Re)install the periodic sync timer; minutes <= 0 disables it. */
   setAutoSync(minutes) {
@@ -989,7 +1313,7 @@ var E2eeSyncPlugin = class extends import_obsidian4.Plugin {
   }
   isConfigured() {
     const s = this.settings;
-    return Boolean(s.serverUrl && s.apiToken && s.encryptionPassword);
+    return Boolean(s.serverUrl && s.apiToken && this.effectivePassword);
   }
   onLayoutReady() {
     this.registerEvent(
@@ -1012,7 +1336,11 @@ var E2eeSyncPlugin = class extends import_obsidian4.Plugin {
         if (file instanceof import_obsidian4.TFile) this.engine.onLocalRenamed(oldPath, file.path);
       })
     );
-    if (this.isConfigured()) {
+    if (this.settings.serverUrl && this.settings.apiToken) {
+      if (!this.effectivePassword && !this.settings.rememberEncryptionPassword) {
+        this.promptForSessionPassword();
+        return;
+      }
       this.setAutoSync(this.settings.autoSyncMinutes);
       const timer = window.setTimeout(() => {
         this.oneShotTimers.delete(timer);

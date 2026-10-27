@@ -42,10 +42,16 @@ export interface PluginSettings {
   serverUrl: string;
   /** Bearer token for the server. */
   apiToken: string;
-  /** E2EE password. Never leaves this device; stored locally in data.json. */
+  /**
+   * E2EE password. Never leaves this device. When rememberEncryptionPassword
+   * is false this stays empty on disk and the live value is kept in memory
+   * only (re-entered once per app session).
+   */
   encryptionPassword: string;
   /** Periodic sync interval in minutes; 0 disables automatic syncing. */
   autoSyncMinutes: number;
+  /** When false, the password is held in memory only, never in data.json. */
+  rememberEncryptionPassword: boolean;
 }
 
 export const DEFAULT_SETTINGS: PluginSettings = {
@@ -53,6 +59,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   apiToken: '',
   encryptionPassword: '',
   autoSyncMinutes: 5,
+  rememberEncryptionPassword: true,
 };
 
 /** Shape of the plugin's persisted data.json. */

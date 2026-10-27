@@ -7,10 +7,17 @@
  * Salt strategy  : deterministic, vault-wide — first 16 bytes of
  *                  SHA-256(vaultId), where vaultId is stable server metadata.
  *                  The derived CryptoKey is cached per salt in memory so the
- *                  expensive PBKDF2 pass runs once per session.
- * Packet format  : [ Salt (16) | IV (12) | AES-GCM ciphertext + 128-bit tag ]
- *                  The salt is embedded in every packet so a future switch to
- *                  random per-file salts stays wire-compatible.
+ *                  expensive PBKDF2 pass runs once per session. Packets
+ *                  carrying any other salt are rejected outright (a hostile
+ *                  server must not be able to force one 210k-iteration pass
+ *                  per file with attacker-chosen salts).
+ * Packet format  : v2 (current): [ 0x02 | Salt (16) | IV (12) | ct + tag ]
+ *                      AES-GCM additionalData (AAD) = 0x02 || NFC(path),
+ *                      binding every ciphertext to its file path so a
+ *                      storage-level swap of two packets fails authentication.
+ *                  v1 (0.1.x, read-only compat): [ Salt | IV | ct + tag ],
+ *                      no AAD. Still decryptable; every re-push upgrades the
+ *                      file to v2.
  * IV policy      : a fresh 12-byte random IV (crypto.getRandomValues) on EVERY
  *                  encryption. IV reuse under the same key is catastrophic in
  *                  GCM and therefore structurally impossible here.
@@ -19,8 +26,12 @@
 const PBKDF2_ITERATIONS = 210_000;
 const SALT_BYTES = 16;
 const IV_BYTES = 12;
-/** Smallest valid packet: header + empty plaintext + 16-byte GCM auth tag. */
-const MIN_PACKET_BYTES = SALT_BYTES + IV_BYTES + 16;
+/** v1 packet: header + empty plaintext + 16-byte GCM auth tag. */
+const PACKET_V1_BYTES = SALT_BYTES + IV_BYTES + 16;
+/** Version byte introduced with AAD binding (v2 packets). */
+const PACKET_V2 = 0x02;
+/** v2 packet: version byte + header + empty plaintext + tag. */
+const PACKET_V2_BYTES = 1 + SALT_BYTES + IV_BYTES + 16;
 
 export const PACKET_HEADER_BYTES = SALT_BYTES + IV_BYTES;
 
@@ -41,10 +52,30 @@ function subtle(): SubtleCrypto {
 
 /**
  * Copy a typed-array view into a standalone ArrayBuffer. Web Crypto accepts
- * views, but copying sidesteps any detached-buffer / TS BufferSource quirks.
+ * views, but copying sidesteps any detached-buffer / TS BufferSource quirks
+ * for the small fixed-size inputs (password, salt, IV).
  */
 function copyBuffer(view: Uint8Array): ArrayBuffer {
   return view.slice().buffer as ArrayBuffer;
+}
+
+/** AAD: version byte + NFC-normalized canonical path. Binds ciphertext to its
+ *  file name so swapping packets between paths fails GCM authentication.
+ *  Returns an exact-sized ArrayBuffer (always a valid BufferSource). */
+function aadBuffer(path: string): ArrayBuffer {
+  const p = new TextEncoder().encode(path.normalize('NFC'));
+  const aad = new Uint8Array(1 + p.length);
+  aad[0] = PACKET_V2;
+  aad.set(p, 1);
+  return aad.buffer as ArrayBuffer;
+}
+
+/** Constant-time-ish equality for small byte strings (salts, verifiers). */
+export function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+  return diff === 0;
 }
 
 export function toHex(bytes: Uint8Array): string {
@@ -56,9 +87,11 @@ export function toHex(bytes: Uint8Array): string {
   return out;
 }
 
-/** Hex SHA-256 of arbitrary bytes (used for ciphertext hashing). */
+/** Hex SHA-256 of arbitrary bytes (used for ciphertext hashing). Zero-copy
+ *  for typed-array views — hashing must not duplicate multi-MB packets. */
 export async function sha256Hex(data: ArrayBuffer | Uint8Array): Promise<string> {
-  const input = data instanceof Uint8Array ? copyBuffer(data) : data;
+  const input: BufferSource =
+    data instanceof Uint8Array ? (data as Uint8Array<ArrayBuffer>) : new Uint8Array(data);
   const digest = await subtle().digest('SHA-256', input);
   return toHex(new Uint8Array(digest));
 }
@@ -98,50 +131,84 @@ export async function saltFromVaultId(vaultId: string): Promise<Uint8Array> {
   return new Uint8Array(digest).slice(0, SALT_BYTES);
 }
 
-/** Encrypt into the [salt | iv | ciphertext+tag] packet. Fresh IV every call. */
+/**
+ * Encrypt into the [0x02 | salt | iv | ciphertext+tag] packet. Fresh IV every
+ * call; the canonical path is authenticated as AAD.
+ */
 export async function encryptBuffer(
   plaintext: ArrayBuffer,
   key: CryptoKey,
   salt: Uint8Array,
+  path: string,
 ): Promise<ArrayBuffer> {
   if (salt.length !== SALT_BYTES) {
     throw new CryptoError(`Salt must be exactly ${SALT_BYTES} bytes.`);
   }
   const iv = window.crypto.getRandomValues(new Uint8Array(IV_BYTES));
   const ciphertext = new Uint8Array(
-    await subtle().encrypt({ name: 'AES-GCM', iv }, key, plaintext),
+    await subtle().encrypt(
+      { name: 'AES-GCM', iv, additionalData: aadBuffer(path) },
+      key,
+      plaintext,
+    ),
   );
-  const packet = new Uint8Array(SALT_BYTES + IV_BYTES + ciphertext.length);
-  packet.set(salt, 0);
-  packet.set(iv, SALT_BYTES);
-  packet.set(ciphertext, SALT_BYTES + IV_BYTES);
+  const packet = new Uint8Array(1 + SALT_BYTES + IV_BYTES + ciphertext.length);
+  packet[0] = PACKET_V2;
+  packet.set(salt, 1);
+  packet.set(iv, 1 + SALT_BYTES);
+  packet.set(ciphertext, 1 + SALT_BYTES + IV_BYTES);
   return packet.buffer as ArrayBuffer;
 }
 
+async function decryptAttempt(
+  bytes: Uint8Array,
+  offset: number,
+  keyForSalt: (salt: Uint8Array) => Promise<CryptoKey>,
+  aad: ArrayBuffer | null,
+): Promise<ArrayBuffer> {
+  const salt = bytes.slice(offset, offset + SALT_BYTES);
+  const iv = copyBuffer(bytes.slice(offset + SALT_BYTES, offset + SALT_BYTES + IV_BYTES));
+  const ciphertext = copyBuffer(bytes.slice(offset + SALT_BYTES + IV_BYTES));
+  const key = await keyForSalt(salt);
+  const algorithm: AesGcmParams = aad
+    ? { name: 'AES-GCM', iv, additionalData: aad }
+    : { name: 'AES-GCM', iv };
+  return subtle().decrypt(algorithm, key, ciphertext);
+}
+
 /**
- * Decrypt a packet. The salt is read from the packet itself and resolved to a
- * CryptoKey through `keyForSalt`, which lets callers cache PBKDF2 results.
- * A tampered packet or wrong password fails GCM authentication and throws
- * CryptoError — it can never yield silent garbage.
+ * Decrypt a packet for a specific canonical path. v2 packets verify the
+ * path-bearing AAD; v1 packets (no AAD) remain readable for migration, with a
+ * v1 retry when a legacy salt's first byte coincidentally equals 0x02. A
+ * tampered packet, swapped ciphertext or wrong password fails GCM
+ * authentication and throws CryptoError — never silent garbage.
  */
 export async function decryptBuffer(
   packet: ArrayBuffer,
   keyForSalt: (salt: Uint8Array) => Promise<CryptoKey>,
+  path: string,
 ): Promise<ArrayBuffer> {
-  if (packet.byteLength < MIN_PACKET_BYTES) {
+  const bytes = new Uint8Array(packet);
+  if (bytes.length < PACKET_V1_BYTES) {
     throw new CryptoError('Encrypted packet is truncated or corrupt.');
   }
-  const bytes = new Uint8Array(packet);
-  const salt = bytes.slice(0, SALT_BYTES);
-  const iv = bytes.slice(SALT_BYTES, SALT_BYTES + IV_BYTES);
-  const ciphertext = bytes.slice(SALT_BYTES + IV_BYTES);
-  const key = await keyForSalt(salt);
+  const additionalData = aadBuffer(path);
+  if (bytes.length >= PACKET_V2_BYTES && bytes[0] === PACKET_V2) {
+    try {
+      return await decryptAttempt(bytes, 1, keyForSalt, additionalData);
+    } catch (err) {
+      if (err instanceof CryptoError) throw err; // e.g. foreign-salt rejection
+      try {
+        return await decryptAttempt(bytes, 0, keyForSalt, null);
+      } catch {
+        throw new CryptoError(
+          'Decryption failed — wrong E2EE password, corrupted file, or ciphertext not created for this path.',
+        );
+      }
+    }
+  }
   try {
-    return await subtle().decrypt(
-      { name: 'AES-GCM', iv: copyBuffer(iv) },
-      key,
-      copyBuffer(ciphertext),
-    );
+    return await decryptAttempt(bytes, 0, keyForSalt, null);
   } catch {
     throw new CryptoError(
       'Decryption failed — wrong E2EE password or corrupted file.',
@@ -151,15 +218,23 @@ export async function decryptBuffer(
 
 /**
  * Session-scoped facade around derive/encrypt/decrypt that caches one key per
- * distinct salt (in practice: one, the deterministic vault salt). Recreate the
- * manager when the user changes the password.
+ * distinct salt (in practice: one, the deterministic vault salt). When
+ * `expectedSalt` is set (normal operation), packets carrying any other salt
+ * are rejected before key derivation. Recreate the manager when the user
+ * changes the password.
  */
 export class CryptoManager {
   private readonly cache = new Map<string, CryptoKey>();
 
-  constructor(private readonly password: string) {}
+  constructor(
+    private readonly password: string,
+    private readonly expectedSalt: Uint8Array | null = null,
+  ) {}
 
   async keyForSalt(salt: Uint8Array): Promise<CryptoKey> {
+    if (this.expectedSalt && !bytesEqual(salt, this.expectedSalt)) {
+      throw new CryptoError('Packet salt does not belong to this vault.');
+    }
     const id = toHex(salt);
     let key = this.cache.get(id);
     if (!key) {
@@ -169,11 +244,11 @@ export class CryptoManager {
     return key;
   }
 
-  async encrypt(plaintext: ArrayBuffer, salt: Uint8Array): Promise<ArrayBuffer> {
-    return encryptBuffer(plaintext, await this.keyForSalt(salt), salt);
+  async encrypt(plaintext: ArrayBuffer, salt: Uint8Array, path: string): Promise<ArrayBuffer> {
+    return encryptBuffer(plaintext, await this.keyForSalt(salt), salt, path);
   }
 
-  async decrypt(packet: ArrayBuffer): Promise<ArrayBuffer> {
-    return decryptBuffer(packet, (salt) => this.keyForSalt(salt));
+  async decrypt(packet: ArrayBuffer, path: string): Promise<ArrayBuffer> {
+    return decryptBuffer(packet, (salt) => this.keyForSalt(salt), path);
   }
 }

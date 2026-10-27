@@ -11,12 +11,8 @@ export function errorMessage(error: unknown): string {
 }
 
 function isLocalHost(hostname: string): boolean {
-  return (
-    hostname === 'localhost' ||
-    hostname === '127.0.0.1' ||
-    hostname === '[::1]' ||
-    hostname.endsWith('.local')
-  );
+  // Loopback only: mDNS ".local" names can be spoofed on hostile networks.
+  return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]';
 }
 
 /**

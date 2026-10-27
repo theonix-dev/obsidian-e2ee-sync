@@ -1,7 +1,7 @@
 {
   "id": "end-to-end-vault-sync",
   "name": "E2EE Vault Sync",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "minAppVersion": "1.13.2",
   "description": "File-by-file end-to-end encrypted sync (AES-GCM + PBKDF2) to your own server. Desktop & mobile.",
   "author": "theonix-dev",

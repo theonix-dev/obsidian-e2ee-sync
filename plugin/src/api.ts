@@ -61,8 +61,9 @@ export class SyncApi {
       throw new ApiError(`"${url}" is not a valid URL (include https://).`, 0);
     }
     const host = parsed.hostname;
-    const isLocal =
-      host === 'localhost' || host === '127.0.0.1' || host === '[::1]' || host.endsWith('.local');
+    // Loopback only: mDNS ".local" names can be spoofed on hostile networks,
+    // so they no longer qualify for the cleartext exemption.
+    const isLocal = host === 'localhost' || host === '127.0.0.1' || host === '[::1]';
     if (parsed.protocol !== 'https:' && !isLocal) {
       throw new ApiError(
         'HTTPS is required for remote sync servers — refusing to send the API token over cleartext.',
@@ -206,7 +207,10 @@ export class SyncApi {
   /** Settings-tab helper: verifies auth + reachability, returns live file count. */
   async testConnection(): Promise<{ fileCount: number; vaultId: string }> {
     const [meta, index] = await Promise.all([this.getMeta(), this.getIndex()]);
-    const live = Object.values(index.files).filter((f) => f && !f.deleted).length;
+    // Internal reserved entries (password verifier) are not user files.
+    const live = Object.entries(index.files).filter(
+      ([p, f]) => f && !f.deleted && !p.startsWith('.e2ee-sync-'),
+    ).length;
     return { fileCount: live, vaultId: meta.vaultId };
   }
 }

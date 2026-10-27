@@ -1,6 +1,6 @@
 {
   "name": "obsidian-e2ee-sync",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "File-by-file E2EE (AES-GCM + PBKDF2) vault sync to your own server. Desktop & mobile.",
   "main": "main.js",
   "type": "module",

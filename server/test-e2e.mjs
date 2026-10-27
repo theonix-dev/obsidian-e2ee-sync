@@ -39,12 +39,22 @@ function ok(condition, label, detail = '') {
 }
 
 // ------------------------------------------------------------ test crypto --
-// Deliberately mirrors plugin/src/crypto.ts byte-for-byte.
+// Deliberately mirrors plugin/src/crypto.ts byte-for-byte (packet v2: AAD
+// binds every ciphertext to its canonical path).
 
 const PBKDF2_ITERATIONS = 210_000;
+const PACKET_V2 = 0x02;
 
 function copyBuffer(view) {
   return view.slice().buffer;
+}
+
+function aadFor(path) {
+  const p = new TextEncoder().encode(path.normalize('NFC'));
+  const aad = new Uint8Array(1 + p.length);
+  aad[0] = PACKET_V2;
+  aad.set(p, 1);
+  return aad;
 }
 
 async function deriveKey(password, salt) {
@@ -69,21 +79,32 @@ async function saltFromVaultId(vaultId) {
   return new Uint8Array(digest).slice(0, 16);
 }
 
-async function encryptBuffer(plaintext, key, salt) {
+async function encryptBuffer(plaintext, key, salt, path) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ciphertext = new Uint8Array(await subtle.encrypt({ name: 'AES-GCM', iv }, key, plaintext));
-  const packet = new Uint8Array(16 + 12 + ciphertext.length);
-  packet.set(salt, 0);
-  packet.set(iv, 16);
-  packet.set(ciphertext, 28);
+  const ciphertext = new Uint8Array(
+    await subtle.encrypt({ name: 'AES-GCM', iv, additionalData: aadFor(path) }, key, plaintext),
+  );
+  const packet = new Uint8Array(1 + 16 + 12 + ciphertext.length);
+  packet[0] = PACKET_V2;
+  packet.set(salt, 1);
+  packet.set(iv, 17);
+  packet.set(ciphertext, 29);
   return packet.buffer;
 }
 
-async function decryptBuffer(packet, key) {
+async function decryptBuffer(packet, key, path) {
   const bytes = new Uint8Array(packet);
-  const iv = bytes.slice(16, 28);
-  const ciphertext = bytes.slice(28);
-  return subtle.decrypt({ name: 'AES-GCM', iv: copyBuffer(iv) }, key, copyBuffer(ciphertext));
+  const isV2 = bytes[0] === PACKET_V2;
+  const head = isV2 ? 1 : 0;
+  const iv = bytes.slice(head + 16, head + 28);
+  const ciphertext = bytes.slice(head + 28);
+  return subtle.decrypt(
+    isV2
+      ? { name: 'AES-GCM', iv: copyBuffer(iv), additionalData: aadFor(path) }
+      : { name: 'AES-GCM', iv: copyBuffer(iv) },
+    key,
+    copyBuffer(ciphertext),
+  );
 }
 
 /** getRandomValues is capped at 64 KiB per call (spec) — fill in chunks. */
@@ -198,7 +219,7 @@ async function run() {
         ['笔记/文件夹 文件 ✨.md', noteBytes.buffer], // unicode + spaces
       ];
       for (const [p, plaintext] of cases) {
-        const packet = await encryptBuffer(plaintext, key, salt);
+        const packet = await encryptBuffer(plaintext, key, salt, p);
         packets[p] = packet;
         const res = await api('POST', '/api/upload', {
           body: packet,
@@ -230,20 +251,29 @@ async function run() {
       }
     }
 
-    console.log('[4] decrypt with the derived key (and wrong-password failure)');
+    console.log('[4] decrypt with the derived key (wrong password / swapped path)');
     {
       const packet = packets['notes/project brief.md'];
-      const decrypted = await decryptBuffer(packet, key);
+      const decrypted = await decryptBuffer(packet, key, 'notes/project brief.md');
       ok(bytesEqual(decrypted, noteBytes.buffer), 'round-trip decrypt returns the original plaintext');
 
       const wrongKey = await deriveKey('hunter2', salt);
       let threw = false;
       try {
-        await decryptBuffer(packet, wrongKey);
+        await decryptBuffer(packet, wrongKey, 'notes/project brief.md');
       } catch {
         threw = true;
       }
       ok(threw, 'wrong password fails GCM authentication (no silent garbage)');
+
+      // AAD binding: the ciphertext of one path must not decrypt under another.
+      let swapThrew = false;
+      try {
+        await decryptBuffer(packet, key, 'passwords.md');
+      } catch {
+        swapThrew = true;
+      }
+      ok(swapThrew, 'ciphertext swapped to a different path fails GCM authentication');
     }
 
     console.log('[5] delete & tombstones');
@@ -266,7 +296,7 @@ async function run() {
       ok(unknown.status === 404, 'delete of an unknown path is 404', `status=${unknown.status}`);
 
       // Re-uploading must clear the tombstone (delete-then-recreate flows).
-      const packet = await encryptBuffer(noteBytes.buffer, key, salt);
+      const packet = await encryptBuffer(noteBytes.buffer, key, salt, 'attachments/big-image.bin');
       const up = await api('POST', '/api/upload', {
         body: packet,
         headers: { 'X-File-Path': encodeURIComponent('attachments/big-image.bin') },
@@ -279,7 +309,7 @@ async function run() {
 
     console.log('[6] integrity & path safety');
     {
-      const packet = await encryptBuffer(noteBytes.buffer, key, salt);
+      const packet = await encryptBuffer(noteBytes.buffer, key, salt, 'integrity/check.bin');
       const mismatch = await api('POST', '/api/upload', {
         body: packet,
         headers: {
@@ -305,8 +335,55 @@ async function run() {
       const abs = await api('GET', `/api/download?path=${encodeURIComponent('/etc/passwd')}`);
       ok(abs.status === 400 || abs.status === 404, 'absolute path rejected', `status=${abs.status}`);
 
+      const absUpload = await api('POST', '/api/upload', {
+        body: packet,
+        headers: {
+          'X-File-Path': encodeURIComponent('/etc/passwd'),
+          'X-Cipher-Hash': sha256Hex(packet),
+        },
+      });
+      ok(absUpload.status === 400, 'absolute path upload rejected (never re-anchored)', `status=${absUpload.status}`);
+
       const notFound = await api('GET', `/api/download?path=${encodeURIComponent('missing/file.md')}`);
       ok(notFound.status === 404, 'download of unknown path is 404');
+
+      // Unicode canonicalization: an NFD (iOS/macOS) spelling must be stored
+      // under its NFC canonical form, not fork into a second entry.
+      const nfdPath = 'unico\u0301de/cafe\u0301.md'; // NFD "únicode/café.md"
+      const nfcPath = nfdPath.normalize('NFC');
+      const nfdUpload = await api('POST', '/api/upload', {
+        body: packet,
+        headers: {
+          'X-File-Path': encodeURIComponent(nfdPath),
+          'X-Cipher-Hash': sha256Hex(packet),
+        },
+      });
+      ok(nfdUpload.ok, 'upload of an NFD path is accepted', `status=${nfdUpload.status}`);
+      ok((await nfdUpload.json()).path === nfcPath, 'NFD path is canonicalized to NFC in the response');
+      const idx6 = await (await api('GET', '/api/index')).json();
+      ok(Boolean(idx6.files[nfcPath]), 'index keys the entry under its NFC form');
+      ok(!Object.keys(idx6.files).some((k) => k === nfdPath), 'no duplicate NFD entry exists');
+      const dlNfc = await api('GET', `/api/download?path=${encodeURIComponent(nfcPath)}`);
+      ok(dlNfc.ok, 'download resolves via the NFC key', `status=${dlNfc.status}`);
+      const dlNfd = await api('GET', `/api/download?path=${encodeURIComponent(nfdPath)}`);
+      ok(dlNfd.ok, 'download of the NFD spelling resolves to the same entry', `status=${dlNfd.status}`);
+
+      // A far-future client mtime must be clamped (protects the clients'
+      // "newest mtime wins" first-sync heuristic from skewed device clocks).
+      const futureUpload = await api('POST', '/api/upload', {
+        body: packet,
+        headers: {
+          'X-File-Path': encodeURIComponent('skew/future.md'),
+          'X-Client-Mtime': String(Date.now() + 365 * 24 * 3600 * 1000),
+          'X-Cipher-Hash': sha256Hex(packet),
+        },
+      });
+      const futureEntry = await futureUpload.json();
+      ok(
+        futureEntry.mtime <= Date.now() + 24 * 3600 * 1000,
+        'far-future X-Client-Mtime is clamped',
+        JSON.stringify(futureEntry),
+      );
     }
 
     console.log('[7] persistence across restart');
@@ -330,7 +407,7 @@ async function run() {
 
         const dl = await api('GET', `/api/download?path=${encodeURIComponent('notes/project brief.md')}`);
         const downloaded = await dl.arrayBuffer();
-        const decrypted = await decryptBuffer(downloaded, key);
+        const decrypted = await decryptBuffer(downloaded, key, 'notes/project brief.md');
         ok(bytesEqual(decrypted, noteBytes.buffer), 'full round-trip works after restart');
       } finally {
         second.child.kill('SIGTERM');
