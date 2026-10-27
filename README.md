@@ -174,6 +174,9 @@ All routes other than `/api/health` require `Authorization: Bearer <AUTH_TOKEN>`
 
 ## Plugin: build and installation
 
+The setup wizards (`install.sh` one-liner, `setup.sh`, `setup.ps1`) automate
+both the build and the file placement described below; the manual procedure is:
+
 ```bash
 cd plugin
 npm install
@@ -244,6 +247,41 @@ Deliberate policy decisions:
   `MAX_BODY_BYTES` (server) together.
 - **413/400 mid-sync** and other per-file problems never abort the run —
   failures are collected, reported via `Notice`, and retried on the next cycle.
+
+## Testing
+
+Automated verification:
+
+```bash
+node server/test-e2e.mjs    # or: make test
+```
+
+The suite replicates the plugin's cryptography byte-for-byte over the real
+REST surface of a spawned server instance.
+
+Manual acceptance checklist (desktop Obsidian, against a locally running
+server):
+
+1. **Single-device round-trip.** Enable the plugin, enter the server URL,
+   token and password, press *Test connection* (a success `Notice` is
+   expected). Create a note; after the 2.5 s debounce and sync cycle the
+   ribbon icon turns to the *synced* state and the path appears in
+   `GET /api/index` while the note text remains absent from server storage.
+2. **Two-device convergence.** Configure a second vault with identical
+   credentials and run *Force full sync*; notes created in the first vault
+   appear in the second, and edits made in either vault converge after sync.
+3. **Conflict handling.** Stop the server, edit the same note differently in
+   both vaults, restart the server and sync both vaults. Each vault retains
+   the remote canonical note plus a `name_conflict_YYYY-MM-DD_HH-mm-ss`
+   copy, and a conflict `Notice` is displayed.
+4. **Deletion propagation.** Delete the note in one vault and sync; the file
+   moves to the system trash in the other vault.
+5. **Binary attachments.** Add an image; it follows the identical encrypted
+   path (verify its ciphertext size in the server index).
+6. **Negative path.** Enter a different password in the second vault: pulls
+   produce a decryption-failure `Notice`, never corrupted content.
+7. **Zero-plaintext audit.** `grep -r "<distinctive phrase from a note>"
+   <DATA_DIR>` must return nothing.
 
 ## Mobile platform compliance
 
