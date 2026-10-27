@@ -33,7 +33,7 @@ the plugin refuses the upload/download), refuse service, or roll back to older c
 ## Quick start (one-liner)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<author>/<repo>/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/theonix-dev/obsidian-e2ee-sync/main/install.sh | bash
 ```
 
 The installer detects how it was invoked: piped from the web it clones the full
@@ -43,7 +43,7 @@ server, install the plugin into a vault, or both — where every parameter is
 asked with a visible default (press Enter to accept it). Windows:
 `powershell -ExecutionPolicy Bypass -File setup.ps1` (after cloning).
 
-> After you fork/push this repository, edit `GITHUB_REPO` at the top of
+> If you fork this repository, edit `GITHUB_REPO` at the top of
 > `install.sh` to point at your `<author>/<repo>`.
 
 ## Repository layout

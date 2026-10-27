@@ -4,6 +4,6 @@
   "version": "1.0.0",
   "minAppVersion": "1.4.0",
   "description": "File-by-file end-to-end encrypted sync (AES-GCM + PBKDF2) to your own server. Desktop & mobile.",
-  "author": "obsidian-sync",
+  "author": "theonix-dev",
   "isDesktopOnly": false
 }

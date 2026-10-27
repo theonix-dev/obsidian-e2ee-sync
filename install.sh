@@ -24,9 +24,9 @@
 
 set -euo pipefail
 
-# vvv EDIT THIS after you fork/push the repository vvv
-GITHUB_REPO="${E2EE_REPO:-YOUR_USERNAME/obsidian-sync}"
-# ^^^                                             ^^^
+# vvv EDIT THIS if you fork the repository vvv
+GITHUB_REPO="${E2EE_REPO:-theonix-dev/obsidian-e2ee-sync}"
+# ^^^                                      ^^^
 
 GIT_URL="${E2EE_GIT_URL:-https://github.com/${GITHUB_REPO}.git}"
 BRANCH="${E2EE_BRANCH:-main}"
