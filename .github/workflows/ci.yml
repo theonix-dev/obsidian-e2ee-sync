@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main, beta]
+  pull_request:
+    branches: [main, beta]
+
+permissions:
+  contents: read
+
+jobs:
+  server:
+    name: Server e2e (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [18, 20, 22]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Run the integration suite (spawns the server, exercises crypto + REST)
+        run: node server/test-e2e.mjs
+
+  plugin:
+    name: Plugin build + bundle cleanliness + specs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        working-directory: plugin
+        run: npm ci --no-fund --no-audit
+
+      - name: Build (typecheck + esbuild bundle)
+        working-directory: plugin
+        run: npm run build
+
+      - name: Bundle cleanliness (mobile compliance)
+        working-directory: plugin
+        run: |
+          node --input-type=module <<'EOF'
+          import { readFileSync } from 'node:fs';
+          const src = readFileSync('main.js', 'utf8');
+          const problems = [];
+          // The bundle must require exactly one external module: "obsidian".
+          // Any other require() means a Node/Electron API leaked into mobile code.
+          for (const m of src.matchAll(/require\((['"])([^'"]+)\1\)/g)) {
+            if (m[2] !== 'obsidian') problems.push(`require("${m[2]}")`);
+          }
+          for (const forbidden of ['process.env', '__dirname', 'Buffer.']) {
+            if (src.includes(forbidden)) problems.push(`bundle references ${forbidden}`);
+          }
+          if (problems.length > 0) {
+            console.error('Bundle cleanliness FAILED:');
+            for (const p of problems) console.error(`  - ${p}`);
+            process.exit(1);
+          }
+          console.log('Bundle cleanliness OK: only require("obsidian"), no Node APIs.');
+          EOF
+
+      - name: Run plugin specs
+        working-directory: plugin
+        run: |
+          status=0
+          found=0
+          for f in test/*.spec.mjs; do
+            [ -e "$f" ] || continue
+            found=1
+            echo "::group::$f"
+            node "$f" || status=1
+            echo "::endgroup::"
+          done
+          if [ "$found" -eq 0 ]; then echo "No spec files present (skipped)."; fi
+          exit $status
