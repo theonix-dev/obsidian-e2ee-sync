@@ -116,7 +116,7 @@ var SyncApi = class {
         true
       );
     }
-    if (response.status < 200 || response.status >= 300) {
+    if ((response.status < 200 || response.status >= 300) && response.status !== 304) {
       let detail = "";
       try {
         detail = ((_b = response.text) != null ? _b : "").slice(0, MAX_ERROR_BODY_CHARS);
@@ -142,29 +142,97 @@ var SyncApi = class {
   async getMeta() {
     return this.parseJson(await this.request("GET", this.buildUrl("/api/meta")));
   }
-  /** Full server state, including tombstones. */
-  async getIndex() {
-    const index = this.parseJson(
-      await this.request("GET", this.buildUrl("/api/index"))
-    );
+  /**
+   * Full server state, including tombstones. When `etag` from a previous
+   * response is supplied and the index is unchanged, the server answers 304
+   * and `notModified` is true (one cheap request ends an idle sync cycle).
+   */
+  async getIndex(etag) {
+    var _a;
+    const headers = {};
+    if (etag) headers["If-None-Match"] = etag;
+    const response = await this.request("GET", this.buildUrl("/api/index"), { headers });
+    if (response.status === 304) {
+      return { index: { files: {} }, etag: etag != null ? etag : "", notModified: true };
+    }
+    const index = this.parseJson(response);
     if (!index || typeof index !== "object" || !index.files) {
       throw new ApiError('Server index response is missing the "files" map.', 0);
     }
-    return index;
+    const newEtag = (_a = this.responseHeader(response, "etag")) != null ? _a : "";
+    return { index, etag: newEtag, notModified: false };
+  }
+  /** Case-insensitive header lookup on a requestUrl response. */
+  responseHeader(response, name) {
+    const headers = response.headers;
+    if (!headers) return null;
+    const lower = name.toLowerCase();
+    for (const [k, v] of Object.entries(headers)) {
+      if (k.toLowerCase() === lower) return v;
+    }
+    return null;
   }
   /**
    * Upload an encrypted packet. Metadata travels in headers (URL-encoded path)
-   * so the body stays pure binary — no multipart overhead.
+   * so the body stays pure binary — no multipart overhead. `keyId` and
+   * `fileVersion` are echoed by the server into its index (packet v3).
    */
-  async upload(path, ciphertext, clientMtime, cipherHash) {
+  async upload(path, ciphertext, clientMtime, cipherHash, meta) {
+    const headers = {
+      "X-File-Path": encodeURIComponent(path),
+      "X-Client-Mtime": String(Math.floor(clientMtime)),
+      "X-Cipher-Hash": cipherHash
+    };
+    if (meta == null ? void 0 : meta.keyId) headers["X-Key-Id"] = meta.keyId;
+    if ((meta == null ? void 0 : meta.fileVersion) !== void 0) headers["X-File-Version"] = String(meta.fileVersion);
     const response = await this.request("POST", this.buildUrl("/api/upload"), {
       body: ciphertext,
-      headers: {
-        "X-File-Path": encodeURIComponent(path),
-        "X-Client-Mtime": String(Math.floor(clientMtime)),
-        "X-Cipher-Hash": cipherHash
-      }
+      headers
     });
+    return this.parseJson(response);
+  }
+  // ------------------------------------------------ chunked transport (v3)
+  /** Begin a resumable chunked upload; returns the staging upload id. */
+  async beginUpload(request) {
+    const response = await this.request("POST", this.buildUrl("/api/upload/begin"), {
+      body: new TextEncoder().encode(JSON.stringify(request)).buffer,
+      headers: { "Content-Type": "application/json" }
+    });
+    return this.parseJson(response);
+  }
+  /**
+   * Upload one encrypted chunk. The server verifies the body against
+   * `chunkHash` (SHA-256 of the ciphertext chunk) and stores it as part `n`.
+   */
+  async uploadChunk(uploadId, n, chunk, chunkHash) {
+    const response = await this.request(
+      "PUT",
+      this.buildUrl("/api/upload/chunk", { uploadId, n: String(n) }),
+      { body: chunk, headers: { "X-Chunk-Hash": chunkHash } }
+    );
+    return this.parseJson(response);
+  }
+  /** Which chunk numbers the server already holds — the resume primitive. */
+  async uploadStatus(uploadId) {
+    const response = await this.request(
+      "GET",
+      this.buildUrl("/api/upload/status", { uploadId })
+    );
+    return this.parseJson(response);
+  }
+  /** Assemble the staged chunks into the final file and index it. */
+  async commitUpload(uploadId, meta) {
+    const response = await this.request(
+      "POST",
+      this.buildUrl("/api/upload/commit", { uploadId }),
+      {
+        headers: {
+          "X-Client-Mtime": String(Math.floor(meta.clientMtime)),
+          "X-Key-Id": meta.keyId,
+          "X-File-Version": String(meta.fileVersion)
+        }
+      }
+    );
     return this.parseJson(response);
   }
   /** Download the encrypted packet for a path. */
@@ -182,9 +250,9 @@ var SyncApi = class {
   }
   /** Settings-tab helper: verifies auth + reachability, returns live file count. */
   async testConnection() {
-    const [meta, index] = await Promise.all([this.getMeta(), this.getIndex()]);
-    const live = Object.entries(index.files).filter(
-      ([p, f]) => f && !f.deleted && !p.startsWith(".e2ee-sync-")
+    const [meta, indexResult] = await Promise.all([this.getMeta(), this.getIndex()]);
+    const live = Object.entries(indexResult.index.files).filter(
+      ([p, f]) => f && !f.deleted && !p.startsWith(".e2ee-")
     ).length;
     return { fileCount: live, vaultId: meta.vaultId };
   }
@@ -194,9 +262,19 @@ var SyncApi = class {
 var PBKDF2_ITERATIONS = 21e4;
 var SALT_BYTES = 16;
 var IV_BYTES = 12;
+var KEY_ID_BYTES = 8;
+var VERSION_BYTES = 8;
+var CT_LEN_BYTES = 4;
+var CHUNK_INDEX_BYTES = 4;
+var MANIFEST_BYTES = 32;
 var PACKET_V1_BYTES = SALT_BYTES + IV_BYTES + 16;
 var PACKET_V2 = 2;
 var PACKET_V2_BYTES = 1 + SALT_BYTES + IV_BYTES + 16;
+var PACKET_V3 = 3;
+var V3_HEADER_BYTES = 1 + KEY_ID_BYTES + SALT_BYTES + IV_BYTES + VERSION_BYTES + CT_LEN_BYTES + CHUNK_INDEX_BYTES;
+var MIN_V3_BYTES = V3_HEADER_BYTES + 16;
+var CHUNK_INDEX_SINGLE = 4294967295;
+var MAX_VERSION = Number.MAX_SAFE_INTEGER;
 var PACKET_HEADER_BYTES = SALT_BYTES + IV_BYTES;
 var CryptoError = class extends Error {
   constructor(message) {
@@ -214,12 +292,45 @@ function subtle() {
 function copyBuffer(view) {
   return view.slice().buffer;
 }
-function aadBuffer(path) {
-  const p = new TextEncoder().encode(path.normalize("NFC"));
+var encoder = new TextEncoder();
+function aadV2(path) {
+  const p = encoder.encode(path.normalize("NFC"));
   const aad = new Uint8Array(1 + p.length);
   aad[0] = PACKET_V2;
   aad.set(p, 1);
   return aad.buffer;
+}
+function aadV3(path, keyId, version, ctLen, chunkIndex, fileManifest) {
+  const p = encoder.encode(path.normalize("NFC"));
+  const manifestLen = fileManifest ? MANIFEST_BYTES : 0;
+  const aad = new Uint8Array(
+    1 + KEY_ID_BYTES + p.length + VERSION_BYTES + CT_LEN_BYTES + CHUNK_INDEX_BYTES + manifestLen
+  );
+  let o = 0;
+  aad[o++] = PACKET_V3;
+  aad.set(keyId, o);
+  o += KEY_ID_BYTES;
+  aad.set(p, o);
+  o += p.length;
+  const dv = new DataView(aad.buffer);
+  writeU64BE(dv, o, version);
+  o += VERSION_BYTES;
+  dv.setUint32(o, ctLen, false);
+  o += CT_LEN_BYTES;
+  dv.setUint32(o, chunkIndex >>> 0, false);
+  o += CHUNK_INDEX_BYTES;
+  if (fileManifest) aad.set(fileManifest, o);
+  return aad.buffer;
+}
+function writeU64BE(dv, offset, value) {
+  const v = Math.floor(value);
+  dv.setUint32(offset, Math.floor(v / 4294967296), false);
+  dv.setUint32(offset + 4, v >>> 0, false);
+}
+function readU64BE(dv, offset) {
+  const hi = dv.getUint32(offset, false);
+  const lo = dv.getUint32(offset + 4, false);
+  return hi * 4294967296 + lo;
 }
 function bytesEqual(a, b) {
   if (a.length !== b.length) return false;
@@ -240,7 +351,12 @@ async function sha256Hex(data) {
   const digest = await subtle().digest("SHA-256", input);
   return toHex(new Uint8Array(digest));
 }
-async function deriveKey(password, salt, iterations = PBKDF2_ITERATIONS) {
+async function sha256Bytes(data) {
+  const input = data instanceof Uint8Array ? data : new Uint8Array(data);
+  const digest = await subtle().digest("SHA-256", input);
+  return new Uint8Array(digest);
+}
+async function deriveKeyMaterial(password, salt, iterations = PBKDF2_ITERATIONS) {
   if (salt.length !== SALT_BYTES) {
     throw new CryptoError(`Salt must be exactly ${SALT_BYTES} bytes.`);
   }
@@ -250,16 +366,29 @@ async function deriveKey(password, salt, iterations = PBKDF2_ITERATIONS) {
     copyBuffer(new TextEncoder().encode(password)),
     "PBKDF2",
     false,
-    ["deriveKey"]
+    ["deriveBits"]
   );
-  return s.deriveKey(
-    { name: "PBKDF2", salt: copyBuffer(salt), iterations, hash: "SHA-256" },
-    material,
+  const bits = new Uint8Array(
+    await s.deriveBits(
+      { name: "PBKDF2", salt: copyBuffer(salt), iterations, hash: "SHA-256" },
+      material,
+      256
+    )
+  );
+  const keyId = (await sha256Bytes(bits)).slice(0, KEY_ID_BYTES);
+  const key = await s.importKey(
+    "raw",
+    copyBuffer(bits),
     { name: "AES-GCM", length: 256 },
     false,
-    // non-extractable: the raw key bytes can never leave Web Crypto
+    // non-extractable: the raw key bytes can never leave Web Crypto again
     ["encrypt", "decrypt"]
   );
+  bits.fill(0);
+  return { key, keyId };
+}
+async function deriveKey(password, salt, iterations = PBKDF2_ITERATIONS) {
+  return (await deriveKeyMaterial(password, salt, iterations)).key;
 }
 async function saltFromVaultId(vaultId) {
   const digest = await subtle().digest(
@@ -268,24 +397,63 @@ async function saltFromVaultId(vaultId) {
   );
   return new Uint8Array(digest).slice(0, SALT_BYTES);
 }
-async function encryptBuffer(plaintext, key, salt, path) {
+function peekV3(packet) {
+  const bytes = packet instanceof Uint8Array ? packet : new Uint8Array(packet);
+  if (bytes.length < MIN_V3_BYTES || bytes[0] !== PACKET_V3) return null;
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const keyId = toHex(bytes.subarray(1, 1 + KEY_ID_BYTES));
+  const version = readU64BE(dv, 1 + KEY_ID_BYTES + SALT_BYTES + IV_BYTES);
+  const ctLen = dv.getUint32(V3_HEADER_BYTES - CT_LEN_BYTES - CHUNK_INDEX_BYTES, false);
+  const chunkIndex = dv.getUint32(V3_HEADER_BYTES - CHUNK_INDEX_BYTES, false);
+  if (!Number.isFinite(version) || version > MAX_VERSION) return null;
+  return { keyId, version, chunkIndex, ctLenHint: ctLen };
+}
+function assertVersionRange(version) {
+  const v = Math.floor(version);
+  if (!Number.isFinite(v) || v < 1 || v > MAX_VERSION) {
+    throw new CryptoError(`Invalid packet version counter: ${version}`);
+  }
+  return v;
+}
+async function sealV3(plaintext, key, keyId, salt, path, version, chunkIndex, fileManifest) {
+  const ver = assertVersionRange(version);
+  const pt = plaintext instanceof Uint8Array ? plaintext : new Uint8Array(plaintext);
+  const iv = window.crypto.getRandomValues(new Uint8Array(IV_BYTES));
+  const ctLen = pt.length;
+  const ciphertext = new Uint8Array(
+    await subtle().encrypt(
+      { name: "AES-GCM", iv, additionalData: aadV3(path, keyId, ver, ctLen, chunkIndex, fileManifest) },
+      key,
+      pt
+    )
+  );
+  const packet = new Uint8Array(V3_HEADER_BYTES + ciphertext.length);
+  const dv = new DataView(packet.buffer);
+  packet[0] = PACKET_V3;
+  packet.set(keyId, 1);
+  packet.set(salt, 1 + KEY_ID_BYTES);
+  packet.set(iv, 1 + KEY_ID_BYTES + SALT_BYTES);
+  const verOff = 1 + KEY_ID_BYTES + SALT_BYTES + IV_BYTES;
+  writeU64BE(dv, verOff, ver);
+  dv.setUint32(verOff + VERSION_BYTES, ctLen, false);
+  dv.setUint32(verOff + VERSION_BYTES + CT_LEN_BYTES, chunkIndex >>> 0, false);
+  packet.set(ciphertext, V3_HEADER_BYTES);
+  return packet.buffer;
+}
+async function encryptBuffer(plaintext, key, keyId, salt, path, version) {
   if (salt.length !== SALT_BYTES) {
     throw new CryptoError(`Salt must be exactly ${SALT_BYTES} bytes.`);
   }
-  const iv = window.crypto.getRandomValues(new Uint8Array(IV_BYTES));
-  const ciphertext = new Uint8Array(
-    await subtle().encrypt(
-      { name: "AES-GCM", iv, additionalData: aadBuffer(path) },
-      key,
-      plaintext
-    )
-  );
-  const packet = new Uint8Array(1 + SALT_BYTES + IV_BYTES + ciphertext.length);
-  packet[0] = PACKET_V2;
-  packet.set(salt, 1);
-  packet.set(iv, 1 + SALT_BYTES);
-  packet.set(ciphertext, 1 + SALT_BYTES + IV_BYTES);
-  return packet.buffer;
+  return sealV3(plaintext, key, keyId, salt, path, version, CHUNK_INDEX_SINGLE, null);
+}
+async function encryptChunk(plaintextChunk, key, keyId, salt, path, version, chunkIndex, fileManifest) {
+  if (salt.length !== SALT_BYTES) {
+    throw new CryptoError(`Salt must be exactly ${SALT_BYTES} bytes.`);
+  }
+  if (fileManifest.length !== MANIFEST_BYTES) {
+    throw new CryptoError("fileManifest must be exactly 32 bytes.");
+  }
+  return sealV3(plaintextChunk, key, keyId, salt, path, version, chunkIndex, fileManifest);
 }
 async function decryptAttempt(bytes, offset, keyForSalt, aad) {
   const salt = bytes.slice(offset, offset + SALT_BYTES);
@@ -295,33 +463,146 @@ async function decryptAttempt(bytes, offset, keyForSalt, aad) {
   const algorithm = aad ? { name: "AES-GCM", iv, additionalData: aad } : { name: "AES-GCM", iv };
   return subtle().decrypt(algorithm, key, ciphertext);
 }
+function foreignOrCorrupt(path) {
+  return new CryptoError(
+    `Decryption failed for ${path} \u2014 wrong E2EE password, corrupted file, or ciphertext not created for this path.`
+  );
+}
+async function decryptV3At(bytes, offset, keyForSalt, path) {
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const keyId = bytes.slice(offset + 1, offset + 1 + KEY_ID_BYTES);
+  const verOff = offset + 1 + KEY_ID_BYTES + SALT_BYTES + IV_BYTES;
+  const version = readU64BE(dv, verOff);
+  const ctLen = dv.getUint32(verOff + VERSION_BYTES, false);
+  const chunkIndex = dv.getUint32(verOff + VERSION_BYTES + CT_LEN_BYTES, false);
+  const salt = bytes.slice(offset + 1 + KEY_ID_BYTES, offset + 1 + KEY_ID_BYTES + SALT_BYTES);
+  const ivOff = offset + 1 + KEY_ID_BYTES + SALT_BYTES;
+  const iv = copyBuffer(bytes.slice(ivOff, ivOff + IV_BYTES));
+  const ctStart = offset + V3_HEADER_BYTES;
+  const ctEnd = ctStart + ctLen + 16;
+  if (ctEnd > bytes.length || version > MAX_VERSION) throw foreignOrCorrupt(path);
+  if (chunkIndex !== CHUNK_INDEX_SINGLE) throw foreignOrCorrupt(path);
+  const key = await keyForSalt(salt);
+  let plaintext;
+  try {
+    plaintext = await subtle().decrypt(
+      { name: "AES-GCM", iv, additionalData: aadV3(path, keyId, version, ctLen, chunkIndex, null) },
+      key,
+      copyBuffer(bytes.subarray(ctStart, ctEnd))
+    );
+  } catch (e) {
+    throw foreignOrCorrupt(path);
+  }
+  return {
+    plaintext,
+    keyId: toHex(keyId),
+    version,
+    chunkIndex,
+    length: V3_HEADER_BYTES + ctLen + 16
+  };
+}
 async function decryptBuffer(packet, keyForSalt, path) {
   const bytes = new Uint8Array(packet);
   if (bytes.length < PACKET_V1_BYTES) {
     throw new CryptoError("Encrypted packet is truncated or corrupt.");
   }
-  const additionalData = aadBuffer(path);
-  if (bytes.length >= PACKET_V2_BYTES && bytes[0] === PACKET_V2) {
+  if (bytes[0] === PACKET_V3 && bytes.length >= MIN_V3_BYTES) {
     try {
-      return await decryptAttempt(bytes, 1, keyForSalt, additionalData);
-    } catch (err) {
-      if (err instanceof CryptoError) throw err;
-      try {
-        return await decryptAttempt(bytes, 0, keyForSalt, null);
-      } catch (e) {
-        throw new CryptoError(
-          "Decryption failed \u2014 wrong E2EE password, corrupted file, or ciphertext not created for this path."
-        );
+      const res = await decryptV3At(bytes, 0, keyForSalt, path);
+      if (res.length === bytes.length) {
+        return { plaintext: res.plaintext, keyId: res.keyId, version: res.version, chunkIndex: res.chunkIndex };
       }
+    } catch (err) {
+      if (!(err instanceof CryptoError)) throw err;
+      if (/does not belong to this vault/.test(err.message)) throw err;
+    }
+  }
+  if (bytes[0] === PACKET_V2 && bytes.length >= PACKET_V2_BYTES) {
+    try {
+      return {
+        plaintext: await decryptAttempt(bytes, 1, keyForSalt, aadV2(path)),
+        keyId: null,
+        version: null,
+        chunkIndex: null
+      };
+    } catch (err) {
+      if (!(err instanceof CryptoError) && !(err instanceof Error)) throw err;
     }
   }
   try {
-    return await decryptAttempt(bytes, 0, keyForSalt, null);
+    return {
+      plaintext: await decryptAttempt(bytes, 0, keyForSalt, null),
+      keyId: null,
+      version: null,
+      chunkIndex: null
+    };
   } catch (e) {
-    throw new CryptoError(
-      "Decryption failed \u2014 wrong E2EE password or corrupted file."
-    );
+    throw foreignOrCorrupt(path);
   }
+}
+async function decryptChunked(blob, keyForSalt, path, fileManifest) {
+  if (fileManifest.length !== MANIFEST_BYTES) {
+    throw new CryptoError("fileManifest must be exactly 32 bytes.");
+  }
+  const bytes = new Uint8Array(blob);
+  if (bytes.length === 0 || bytes[0] !== PACKET_V3) {
+    throw foreignOrCorrupt(path);
+  }
+  const chunks = [];
+  let keyId = null;
+  let version = null;
+  let offset = 0;
+  while (offset < bytes.length) {
+    if (bytes.length - offset < MIN_V3_BYTES || bytes[offset] !== PACKET_V3) {
+      throw foreignOrCorrupt(path);
+    }
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const hdrKeyId = bytes.slice(offset + 1, offset + 1 + KEY_ID_BYTES);
+    const verOff = offset + 1 + KEY_ID_BYTES + SALT_BYTES + IV_BYTES;
+    const v = readU64BE(dv, verOff);
+    const ctLen = dv.getUint32(verOff + VERSION_BYTES, false);
+    const chunkIndex = dv.getUint32(verOff + VERSION_BYTES + CT_LEN_BYTES, false);
+    const salt = bytes.slice(offset + 1 + KEY_ID_BYTES, offset + 1 + KEY_ID_BYTES + SALT_BYTES);
+    const ivOff = offset + 1 + KEY_ID_BYTES + SALT_BYTES;
+    const iv = copyBuffer(bytes.slice(ivOff, ivOff + IV_BYTES));
+    const ctStart = offset + V3_HEADER_BYTES;
+    const ctEnd = ctStart + ctLen + 16;
+    if (ctEnd > bytes.length || v > MAX_VERSION) throw foreignOrCorrupt(path);
+    if (chunkIndex !== chunks.length) throw foreignOrCorrupt(path);
+    const hexKeyId = toHex(hdrKeyId);
+    if (keyId === null) keyId = hexKeyId;
+    else if (keyId !== hexKeyId) throw foreignOrCorrupt(path);
+    if (version === null) version = v;
+    else if (version !== v) throw foreignOrCorrupt(path);
+    const key = await keyForSalt(salt);
+    let plaintext;
+    try {
+      plaintext = await subtle().decrypt(
+        {
+          name: "AES-GCM",
+          iv,
+          additionalData: aadV3(path, hdrKeyId, v, ctLen, chunkIndex, fileManifest)
+        },
+        key,
+        copyBuffer(bytes.subarray(ctStart, ctEnd))
+      );
+    } catch (e) {
+      throw foreignOrCorrupt(path);
+    }
+    chunks.push(plaintext);
+    offset = ctEnd;
+  }
+  if (keyId === null || version === null || chunks.length === 0) {
+    throw foreignOrCorrupt(path);
+  }
+  const total = chunks.reduce((n, c) => n + c.byteLength, 0);
+  const out = new Uint8Array(total);
+  let o = 0;
+  for (const c of chunks) {
+    out.set(new Uint8Array(c), o);
+    o += c.byteLength;
+  }
+  return { plaintext: out.buffer, keyId, version, chunkCount: chunks.length };
 }
 var CryptoManager = class {
   constructor(password, expectedSalt = null) {
@@ -329,23 +610,34 @@ var CryptoManager = class {
     this.expectedSalt = expectedSalt;
     this.cache = /* @__PURE__ */ new Map();
   }
-  async keyForSalt(salt) {
+  async keyMaterial(salt) {
     if (this.expectedSalt && !bytesEqual(salt, this.expectedSalt)) {
       throw new CryptoError("Packet salt does not belong to this vault.");
     }
     const id = toHex(salt);
-    let key = this.cache.get(id);
-    if (!key) {
-      key = await deriveKey(this.password, salt);
-      this.cache.set(id, key);
+    let km = this.cache.get(id);
+    if (!km) {
+      km = await deriveKeyMaterial(this.password, salt);
+      this.cache.set(id, km);
     }
-    return key;
+    return km;
   }
-  async encrypt(plaintext, salt, path) {
-    return encryptBuffer(plaintext, await this.keyForSalt(salt), salt, path);
+  async keyForSalt(salt) {
+    return (await this.keyMaterial(salt)).key;
+  }
+  async encrypt(plaintext, salt, path, version) {
+    const km = await this.keyMaterial(salt);
+    return encryptBuffer(plaintext, km.key, km.keyId, salt, path, version);
+  }
+  async encryptChunk(plaintextChunk, salt, path, version, chunkIndex, fileManifest) {
+    const km = await this.keyMaterial(salt);
+    return encryptChunk(plaintextChunk, km.key, km.keyId, salt, path, version, chunkIndex, fileManifest);
   }
   async decrypt(packet, path) {
     return decryptBuffer(packet, (salt) => this.keyForSalt(salt), path);
+  }
+  async decryptChunked(blob, path, fileManifest) {
+    return decryptChunked(blob, (salt) => this.keyForSalt(salt), path, fileManifest);
   }
 };
 
@@ -384,16 +676,33 @@ function validateServerUrl(url) {
 var DEBOUNCE_MS = 2500;
 var IGNORE_WINDOW_MS = 500;
 var JOURNAL_FLUSH_EVERY = 20;
-var VERIFIER_PATH = ".e2ee-sync-verifier.v1";
+var VERIFIER_PREFIX = ".e2ee-verifier.";
+var VERIFIER_LEGACY_PATH = ".e2ee-sync-verifier.v1";
 var VERIFIER_PLAINTEXT = new TextEncoder().encode("e2ee-verifier-v1\0");
-var MAX_SYNCABLE_BYTES = 256 * 1024 * 1024;
+function verifierPathFor(keyIdHex) {
+  return VERIFIER_PREFIX + keyIdHex;
+}
+function isVerifierPath(p) {
+  return p === VERIFIER_LEGACY_PATH || p.startsWith(VERIFIER_PREFIX);
+}
+function hexToBytes(hex) {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = parseInt(hex.substring(i * 2, i * 2 + 2), 16);
+  }
+  return out;
+}
+var MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024;
+var CHUNKED_ABOVE_BYTES = 16 * 1024 * 1024;
+var CHUNK_PLAINTEXT_BYTES = 8 * 1024 * 1024;
+var CHUNK_RETRIES = 2;
 var EXCLUDED_PREFIXES = [".trash/"];
 var EXCLUDED_NAMES = /* @__PURE__ */ new Set([".DS_Store", "Thumbs.db", "desktop.ini"]);
 function canonicalPath(p) {
   return (0, import_obsidian2.normalizePath)(p).normalize("NFC");
 }
 function isSyncablePath(p, configDir) {
-  if (p === VERIFIER_PATH) return false;
+  if (isVerifierPath(p)) return false;
   const name = p.slice(p.lastIndexOf("/") + 1);
   if (EXCLUDED_NAMES.has(name)) return false;
   const prefixes = [`${configDir.replace(/\/+$/, "")}/`, ...EXCLUDED_PREFIXES];
@@ -401,6 +710,92 @@ function isSyncablePath(p, configDir) {
     if (p === prefix.slice(0, -1) || p.startsWith(prefix)) return false;
   }
   return true;
+}
+function planSync(locals, remote, journal, configDir) {
+  var _a;
+  const ops = [];
+  const byLower = /* @__PURE__ */ new Map();
+  for (const p of locals.keys()) {
+    const lower = p.toLowerCase();
+    const group = (_a = byLower.get(lower)) != null ? _a : [];
+    group.push(p);
+    byLower.set(lower, group);
+  }
+  const caseRenamed = /* @__PURE__ */ new Set();
+  for (const [, group] of byLower) {
+    if (group.length < 2) continue;
+    group.sort();
+    for (const p of group.slice(1)) {
+      caseRenamed.add(p);
+      ops.push({ action: "case-rename", path: p, local: locals.get(p) });
+    }
+  }
+  const paths = /* @__PURE__ */ new Set([
+    ...locals.keys(),
+    ...Object.keys(journal),
+    ...remote.keys()
+  ]);
+  for (const path of paths) {
+    if (!isSyncablePath(path, configDir)) continue;
+    if (caseRenamed.has(path)) continue;
+    const local = locals.get(path);
+    const record = journal[path];
+    const entry = remote.get(path);
+    const rem = entry == null ? void 0 : entry.info;
+    const remoteKey = entry == null ? void 0 : entry.key;
+    if (rem && !rem.deleted) {
+      const remoteChanged = !record || rem.hash !== record.remoteHash;
+      if (local) {
+        const localChanged = !record || local.stat.mtime > record.localMtime;
+        if (localChanged && remoteChanged) {
+          if (record) {
+            ops.push({ action: "conflict", path, local, remote: rem, remoteKey });
+          } else if (rem.mtime >= local.stat.mtime) {
+            ops.push({ action: "pull", path, local, remote: rem, remoteKey });
+          } else {
+            ops.push({ action: "push", path, local });
+          }
+        } else if (localChanged) {
+          ops.push({ action: "push", path, local });
+        } else if (remoteChanged) {
+          ops.push({ action: "pull", path, local, remote: rem, remoteKey });
+        }
+      } else if (record && !remoteChanged) {
+        ops.push({ action: "delete-remote", path, remote: rem, remoteKey });
+      } else {
+        ops.push({ action: "pull", path, remote: rem, remoteKey });
+      }
+    } else {
+      if (!local) {
+        if (record) ops.push({ action: "forget", path });
+        continue;
+      }
+      const localChanged = !record || local.stat.mtime > record.localMtime;
+      if (localChanged) {
+        ops.push({ action: "push", path, local });
+      } else {
+        ops.push({ action: "delete-local", path, local });
+      }
+    }
+  }
+  return ops;
+}
+function findCaseVariant(path, localPaths) {
+  const lower = path.toLowerCase();
+  for (const p of localPaths) {
+    if (p !== path && p.toLowerCase() === lower) return p;
+  }
+  return null;
+}
+function rollbackReason(recordVersion, packetVersion) {
+  if (recordVersion === void 0 || recordVersion <= 0) return null;
+  if (packetVersion === 0) {
+    return `Rollback detected: the file arrived as a pre-v3 packet after version ${recordVersion} was already synced \u2014 refusing to overwrite local state.`;
+  }
+  if (packetVersion < recordVersion) {
+    return `Rollback detected: the file arrived as version ${packetVersion}, but this device already synced version ${recordVersion} \u2014 refusing to overwrite local state.`;
+  }
+  return null;
 }
 var SyncEngine = class {
   constructor(ctx) {
@@ -411,6 +806,13 @@ var SyncEngine = class {
     this.cryptoPassword = "";
     this.vaultId = "";
     this.salt = null;
+    this.keyIdHex = "";
+    /** Live password override set after a successful password-challenge prompt. */
+    this.passwordOverride = null;
+    /** ETag of the last fully processed index (PROB-6 idle-cycle shortcut). */
+    this.lastIndexEtag = "";
+    /** True while a password rotation is streaming re-encryption (PROB-1). */
+    this.rotating = false;
     /** Canonical paths we are writing ourselves; vault events for them are ignored. */
     this.ignorePaths = /* @__PURE__ */ new Set();
     /** Per-path debounce timers, keyed by canonical path. */
@@ -420,6 +822,8 @@ var SyncEngine = class {
     this.running = false;
     this.rerunRequested = false;
     this.journalOpsSinceFlush = 0;
+    /** Local files snapshot of the running cycle (case-collision checks). */
+    this.planLocals = null;
     this.configDir = ctx.app.vault.configDir;
   }
   dispose() {
@@ -435,6 +839,7 @@ var SyncEngine = class {
     this.cryptoPassword = "";
     this.vaultId = "";
     this.salt = null;
+    this.keyIdHex = "";
   }
   // ------------------------------------------------------------ event input
   onLocalCreated(path) {
@@ -480,7 +885,7 @@ var SyncEngine = class {
   }
   // ------------------------------------------------------------ main cycle
   async runFullSync() {
-    var _a;
+    var _a, _b;
     if (this.running) {
       this.rerunRequested = true;
       return null;
@@ -488,18 +893,33 @@ var SyncEngine = class {
     this.running = true;
     try {
       const settings = this.ctx.getSettings();
-      if (!settings.serverUrl || !settings.apiToken || !settings.encryptionPassword) {
+      const password = (_a = this.passwordOverride) != null ? _a : settings.encryptionPassword;
+      if (!settings.serverUrl || !settings.apiToken || !password) {
         this.ctx.setStatus("error", "not configured (see plugin settings)");
         this.ctx.notify("E2EE Sync: set server URL, API token and E2EE password in the plugin settings first.");
         return null;
       }
-      const setup = await this.ensureSetup();
+      const api = this.ensureApi(settings);
+      const indexResult = await api.getIndex(this.lastIndexEtag || void 0);
+      if (indexResult.notModified) {
+        this.ctx.setStatus("synced");
+        return {
+          pushed: 0,
+          pulled: 0,
+          conflicts: 0,
+          deletedLocal: 0,
+          deletedRemote: 0,
+          failures: []
+        };
+      }
+      const setup = await this.ensureSetup(api, password, indexResult.index);
+      this.lastIndexEtag = indexResult.etag;
       this.ctx.setStatus("syncing");
-      const remoteIndex = await setup.api.getIndex();
-      const remote = this.canonicalizeRemote((_a = remoteIndex.files) != null ? _a : {});
+      const remote = this.canonicalizeRemote((_b = indexResult.index.files) != null ? _b : {});
       const locals = this.collectLocalFiles();
       const journal = this.ctx.getJournal();
-      const plan = this.planSync(locals, remote, journal);
+      const plan = planSync(locals, remote, journal, this.configDir);
+      this.planLocals = locals;
       const deletes = plan.filter((op) => op.action === "delete-local");
       if (deletes.length > 0 && deletes.length >= this.massDeleteThreshold(locals.size) && this.ctx.confirmMassDeletion && !await this.ctx.confirmMassDeletion(deletes.length, locals.size)) {
         for (const op of deletes) op.action = "forget";
@@ -531,6 +951,7 @@ var SyncEngine = class {
       return null;
     } finally {
       this.running = false;
+      this.planLocals = null;
       if (this.rerunRequested) {
         this.rerunRequested = false;
         const timer = window.setTimeout(() => {
@@ -568,66 +989,38 @@ var SyncEngine = class {
     }
     return out;
   }
-  /** Pure decision function — no I/O, straightforward to reason about. */
-  planSync(locals, remote, journal) {
-    const paths = /* @__PURE__ */ new Set([
-      ...locals.keys(),
-      ...Object.keys(journal),
-      ...remote.keys()
-    ]);
-    const ops = [];
-    for (const path of paths) {
-      if (!isSyncablePath(path, this.configDir)) continue;
-      const local = locals.get(path);
-      const record = journal[path];
-      const entry = remote.get(path);
-      const rem = entry == null ? void 0 : entry.info;
-      const remoteKey = entry == null ? void 0 : entry.key;
-      if (rem && !rem.deleted) {
-        const remoteChanged = !record || rem.hash !== record.remoteHash;
-        if (local) {
-          const localChanged = !record || local.stat.mtime > record.localMtime;
-          if (localChanged && remoteChanged) {
-            if (record) {
-              ops.push({ action: "conflict", path, local, remote: rem, remoteKey });
-            } else if (rem.mtime >= local.stat.mtime) {
-              ops.push({ action: "pull", path, local, remote: rem, remoteKey });
-            } else {
-              ops.push({ action: "push", path, local });
-            }
-          } else if (localChanged) {
-            ops.push({ action: "push", path, local });
-          } else if (remoteChanged) {
-            ops.push({ action: "pull", path, local, remote: rem, remoteKey });
-          }
-        } else if (record && !remoteChanged) {
-          ops.push({ action: "delete-remote", path, remote: rem, remoteKey });
-        } else {
-          ops.push({ action: "pull", path, remote: rem, remoteKey });
-        }
-      } else {
-        if (!local) {
-          if (record) ops.push({ action: "forget", path });
-          continue;
-        }
-        const localChanged = !record || local.stat.mtime > record.localMtime;
-        if (localChanged) {
-          ops.push({ action: "push", path, local });
-        } else {
-          ops.push({ action: "delete-local", path, local });
-        }
-      }
-    }
-    return ops;
-  }
-  /**
-   * More than this many (or this fraction of) remote deletions in one cycle
-   * requires the user's explicit consent — guards against server-side wipes.
-   */
+  /** More than this many (or this fraction of) remote deletions in one cycle
+   *  requires the user's explicit consent — guards against server-side wipes. */
   massDeleteThreshold(localCount) {
     return Math.max(5, Math.floor(localCount * 0.1));
   }
   // ------------------------------------------------------------ execution
+  /**
+   * Fixed-size worker pool (PROB-7): pulls N items through `fn` with at most
+   * `concurrency` in flight. JS single-threadedness makes the shared `next`
+   * index race-free.
+   */
+  async runPool(items, concurrency, fn) {
+    let next = 0;
+    const workers = Array.from(
+      { length: Math.max(1, Math.min(concurrency, items.length)) },
+      async () => {
+        for (; ; ) {
+          const idx = next++;
+          if (idx >= items.length) return;
+          await fn(items[idx]);
+        }
+      }
+    );
+    await Promise.all(workers);
+  }
+  /**
+   * Execute the plan with bounded parallelism (PROB-7): downloads ×3, uploads
+   * (pushes + conflicts) ×2, destructive/local-mutating ops serialized ×1.
+   * The planner emits exactly one op per path, so per-path ordering is
+   * preserved by construction; memory stays bounded because payloads are
+   * ≤ CHUNK_PLAINTEXT_BYTES per transfer after PROB-3.
+   */
   async executePlan(plan, setup) {
     const summary = {
       pushed: 0,
@@ -637,7 +1030,7 @@ var SyncEngine = class {
       deletedRemote: 0,
       failures: []
     };
-    for (const op of plan) {
+    const runOp = async (op) => {
       try {
         switch (op.action) {
           case "forget":
@@ -653,6 +1046,9 @@ var SyncEngine = class {
           case "conflict":
             await this.doConflict(op, setup, summary);
             break;
+          case "case-rename":
+            await this.doCaseRename(op, summary);
+            break;
           case "delete-local":
             await this.doDeleteLocal(op, summary);
             break;
@@ -663,7 +1059,21 @@ var SyncEngine = class {
       } catch (error) {
         summary.failures.push({ path: op.path, error: errorMessage(error) });
       }
+    };
+    const forgets = [];
+    const downloads = [];
+    const uploads = [];
+    const serialized = [];
+    for (const op of plan) {
+      if (op.action === "forget") forgets.push(op);
+      else if (op.action === "pull") downloads.push(op);
+      else if (op.action === "push" || op.action === "conflict") uploads.push(op);
+      else serialized.push(op);
     }
+    for (const op of forgets) await runOp(op);
+    await this.runPool(serialized, 1, runOp);
+    await this.runPool(uploads, 2, runOp);
+    await this.runPool(downloads, 3, runOp);
     if (summary.failures.length > 0) {
       const first = summary.failures[0];
       this.ctx.notify(
@@ -675,28 +1085,110 @@ var SyncEngine = class {
   }
   /** Read, encrypt and upload one vault file; then update its journal entry. */
   async doPush(op, setup, summary) {
+    var _a;
     const file = this.ctx.app.vault.getAbstractFileByPath(op.local ? op.local.path : op.path);
     if (!(file instanceof import_obsidian2.TFile)) return;
-    if (file.stat.size > MAX_SYNCABLE_BYTES) {
+    if (file.stat.size > MAX_FILE_BYTES) {
       throw new Error(
-        `${op.path} is ${Math.round(file.stat.size / 1048576)} MB \u2014 above the sync limit of ${Math.round(MAX_SYNCABLE_BYTES / 1048576)} MB. Sync it manually or raise the limit.`
+        `${op.path} is ${Math.round(file.stat.size / 1048576)} MB \u2014 above the sync limit of ${Math.round(MAX_FILE_BYTES / 1048576)} MB.`
       );
     }
     const plaintext = await this.ctx.app.vault.readBinary(file);
-    const packet = await setup.crypto.encrypt(plaintext, setup.salt, op.path);
-    const cipherHash = await sha256Hex(new Uint8Array(packet));
-    const uploaded = await setup.api.upload(op.path, packet, file.stat.mtime, cipherHash);
+    const record = this.ctx.getJournal()[op.path];
+    const version = ((_a = record == null ? void 0 : record.remoteVersion) != null ? _a : 0) + 1;
+    const uploaded = await this.encryptAndUpload(
+      setup,
+      op.path,
+      plaintext,
+      file.stat.mtime,
+      version
+    );
     this.ctx.setJournalEntry(op.path, {
       localMtime: file.stat.mtime,
-      remoteHash: uploaded && uploaded.hash ? uploaded.hash : cipherHash,
-      remoteMtime: uploaded && uploaded.mtime ? uploaded.mtime : Date.now()
+      remoteHash: uploaded.hash,
+      remoteMtime: uploaded.mtime,
+      remoteVersion: version
     });
     this.markJournalDirty();
     summary.pushed++;
   }
+  /**
+   * Encrypt `plaintext` for `path` under the setup's key at `version` and
+   * upload it — single-shot for small files, chunked and resumable above
+   * CHUNKED_ABOVE_BYTES (PROB-3). Returns the server's index entry.
+   */
+  async encryptAndUpload(setup, path, plaintext, clientMtime, version) {
+    const bytes = new Uint8Array(plaintext);
+    if (plaintext.byteLength <= CHUNKED_ABOVE_BYTES) {
+      const packet = await setup.crypto.encrypt(plaintext, setup.salt, path, version);
+      return setup.api.upload(path, packet, clientMtime, await sha256Hex(new Uint8Array(packet)), {
+        keyId: setup.keyIdHex,
+        fileVersion: version
+      });
+    }
+    const slices = [];
+    for (let o = 0; o < bytes.length; o += CHUNK_PLAINTEXT_BYTES) {
+      slices.push([o, Math.min(o + CHUNK_PLAINTEXT_BYTES, bytes.length)]);
+    }
+    let manifestInput = new Uint8Array(slices.length * 32);
+    for (let i = 0; i < slices.length; i++) {
+      const [o, end] = slices[i];
+      const h = await sha256Bytes(bytes.subarray(o, end));
+      manifestInput.set(h, i * 32);
+    }
+    const fileManifest = await sha256Bytes(manifestInput);
+    manifestInput = new Uint8Array(0);
+    const { uploadId } = await setup.api.beginUpload({
+      path,
+      // Declared assembled-size bound: plaintext + per-chunk header/tag
+      // overhead. The server rejects assemblies that would exceed it (or its
+      // own MAX_FILE_BYTES, whichever is smaller).
+      totalBytes: plaintext.byteLength + slices.length * 128,
+      chunkCount: slices.length,
+      fileManifest: toHex(fileManifest)
+    });
+    for (let i = 0; i < slices.length; i++) {
+      const [o, end] = slices[i];
+      const chunkPlain = bytes.slice(o, end);
+      const packet = await setup.crypto.encryptChunk(
+        chunkPlain.buffer,
+        setup.salt,
+        path,
+        version,
+        i,
+        fileManifest
+      );
+      await this.putChunkWithRetry(setup, uploadId, i, packet);
+    }
+    return setup.api.commitUpload(uploadId, {
+      clientMtime,
+      keyId: setup.keyIdHex,
+      fileVersion: version
+    });
+  }
+  /** PUT one chunk with bounded retries (network errors) and status-based resume. */
+  async putChunkWithRetry(setup, uploadId, n, packet) {
+    let lastError = null;
+    for (let attempt = 0; attempt <= CHUNK_RETRIES; attempt++) {
+      try {
+        await setup.api.uploadChunk(uploadId, n, packet, await sha256Hex(new Uint8Array(packet)));
+        return;
+      } catch (error) {
+        lastError = error;
+        if (!(error instanceof ApiError) || !error.isNetworkError) throw error;
+        await new Promise((r) => window.setTimeout(r, 500 * (attempt + 1)));
+      }
+    }
+    try {
+      const status = await setup.api.uploadStatus(uploadId);
+      if (status.accepted.includes(n)) return;
+    } catch (e) {
+    }
+    throw lastError;
+  }
   /** Download, decrypt and write one remote file; then update its journal. */
   async doPull(op, setup, summary) {
-    var _a;
+    var _a, _b, _c, _d, _e, _f;
     const remote = op.remote;
     if (!remote) throw new Error("Pull planned without remote metadata.");
     let packet;
@@ -716,29 +1208,73 @@ var SyncEngine = class {
         `Integrity check failed: downloaded bytes do not match the server index (rollback or corruption) \u2014 refusing to overwrite ${op.path}.`
       );
     }
-    const plaintext = await setup.crypto.decrypt(packet, op.path);
-    const existing = this.ctx.app.vault.getAbstractFileByPath(op.local ? op.local.path : op.path);
-    if (existing && !(existing instanceof import_obsidian2.TFile)) {
-      throw new Error(`Local path exists but is a folder: ${op.path}`);
+    const record = this.ctx.getJournal()[op.path];
+    const manifest = remote.manifest && remote.manifest.length === 64 ? remote.manifest : null;
+    if (record && ((_b = remote.ver) != null ? _b : 0) > 0 && ((_c = remote.ver) != null ? _c : 0) < record.remoteVersion) {
+      throw new Error(
+        `Rollback detected: server reports version ${remote.ver} for ${op.path}, but this device already synced version ${record.remoteVersion} \u2014 refusing the pull.`
+      );
     }
-    this.beginIgnore(op.path);
+    let plaintext;
+    let packetVersion;
+    if (manifest) {
+      const manifestBytes = hexToBytes(manifest);
+      const peek = peekV3(new Uint8Array(packet));
+      if (peek && peek.keyId && peek.keyId !== setup.keyIdHex) {
+        throw new CryptoError(
+          `${op.path} was encrypted with a different E2EE password (key ${peek.keyId.slice(0, 8)}\u2026). If the password was changed on another device, update it in the plugin settings.`
+        );
+      }
+      const res = await setup.crypto.decryptChunked(packet, op.path, manifestBytes);
+      plaintext = res.plaintext;
+      packetVersion = res.version;
+    } else {
+      const peek = peekV3(new Uint8Array(packet));
+      if (peek && peek.keyId && peek.keyId !== setup.keyIdHex) {
+        throw new CryptoError(
+          `${op.path} was encrypted with a different E2EE password (key ${peek.keyId.slice(0, 8)}\u2026). If the password was changed on another device, update it in the plugin settings.`
+        );
+      }
+      const res = await setup.crypto.decrypt(packet, op.path);
+      plaintext = res.plaintext;
+      packetVersion = (_d = res.version) != null ? _d : 0;
+    }
+    const refusal = record ? rollbackReason(record.remoteVersion, packetVersion) : null;
+    if (refusal) throw new Error(`${refusal} (${op.path})`);
+    const caseVariant = findCaseVariant(op.path, (_f = (_e = this.planLocals) == null ? void 0 : _e.keys()) != null ? _f : []);
+    const targetPath = caseVariant ? this.uniqueConflictPath(op.path, "_remote-case_") : op.path;
+    if (caseVariant) {
+      this.ctx.notify(
+        `Case collision: "${op.path}" and "${caseVariant}" differ only by letter case \u2014 the downloaded copy was saved as "${targetPath}".`,
+        12e3
+      );
+    }
+    const existing = this.ctx.app.vault.getAbstractFileByPath(
+      !caseVariant && op.local ? op.local.path : targetPath
+    );
+    if (existing && !(existing instanceof import_obsidian2.TFile)) {
+      throw new Error(`Local path exists but is a folder: ${targetPath}`);
+    }
+    this.beginIgnore(targetPath);
     try {
       if (existing) {
         await this.ctx.app.vault.modifyBinary(existing, plaintext);
       } else {
-        await this.ensureParentFolder(op.path);
-        await this.ctx.app.vault.createBinary(op.path, plaintext);
+        await this.ensureParentFolder(targetPath);
+        await this.ctx.app.vault.createBinary(targetPath, plaintext);
       }
     } catch (error) {
-      this.ignorePaths.delete(op.path);
+      this.ignorePaths.delete(targetPath);
       throw error;
     }
-    const written = this.ctx.app.vault.getAbstractFileByPath(op.path);
-    this.ctx.setJournalEntry(op.path, {
+    const written = this.ctx.app.vault.getAbstractFileByPath(targetPath);
+    this.ctx.setJournalEntry(targetPath, {
       localMtime: written instanceof import_obsidian2.TFile ? written.stat.mtime : Date.now(),
       remoteHash: remote.hash,
-      remoteMtime: remote.mtime
+      remoteMtime: remote.mtime,
+      remoteVersion: packetVersion
     });
+    if (caseVariant) this.ctx.setJournalEntry(op.path, null);
     this.markJournalDirty();
     summary.pulled++;
   }
@@ -750,13 +1286,21 @@ var SyncEngine = class {
    *  3. download the remote version into the original path.
    */
   async doConflict(op, setup, summary) {
-    const local = op.local;
-    if (!local) return;
+    var _a;
+    if (!op.local) return;
+    const local = this.ctx.app.vault.getAbstractFileByPath(op.local.path);
+    if (!(local instanceof import_obsidian2.TFile)) return;
     const conflictPath = this.uniqueConflictPath(op.path);
     const localCopy = await this.ctx.app.vault.readBinary(local);
-    const packet = await setup.crypto.encrypt(localCopy, setup.salt, conflictPath);
-    const cipherHash = await sha256Hex(new Uint8Array(packet));
-    const uploaded = await setup.api.upload(conflictPath, packet, local.stat.mtime, cipherHash);
+    const record = this.ctx.getJournal()[op.path];
+    const version = ((_a = record == null ? void 0 : record.remoteVersion) != null ? _a : 0) + 1;
+    const uploaded = await this.encryptAndUpload(
+      setup,
+      conflictPath,
+      localCopy,
+      local.stat.mtime,
+      version
+    );
     this.beginIgnore(conflictPath);
     try {
       await this.ctx.app.vault.createBinary(conflictPath, localCopy);
@@ -767,8 +1311,9 @@ var SyncEngine = class {
     const written = this.ctx.app.vault.getAbstractFileByPath(conflictPath);
     this.ctx.setJournalEntry(conflictPath, {
       localMtime: written instanceof import_obsidian2.TFile ? written.stat.mtime : local.stat.mtime,
-      remoteHash: uploaded && uploaded.hash ? uploaded.hash : cipherHash,
-      remoteMtime: uploaded && uploaded.mtime ? uploaded.mtime : Date.now()
+      remoteHash: uploaded.hash,
+      remoteMtime: uploaded.mtime,
+      remoteVersion: version
     });
     this.markJournalDirty();
     await this.doPull({ ...op, local: void 0, remoteKey: op.remoteKey }, setup, summary);
@@ -777,6 +1322,29 @@ var SyncEngine = class {
       `Conflict detected in file: ${op.path}
 Both versions kept \u2014 local copy saved as: ${conflictPath}`,
       1e4
+    );
+  }
+  /** Keep-both for two local files differing only by ASCII case (PROB-4). */
+  async doCaseRename(op, summary) {
+    const file = op.local instanceof import_obsidian2.TFile ? op.local : null;
+    const target = file != null ? file : this.ctx.app.vault.getAbstractFileByPath(op.path);
+    if (!(target instanceof import_obsidian2.TFile)) return;
+    const renamed = this.uniqueConflictPath(op.path, "_case-collision_");
+    this.beginIgnore(op.path);
+    this.beginIgnore(renamed);
+    try {
+      await this.ctx.app.vault.rename(target, renamed);
+    } catch (error) {
+      this.ignorePaths.delete(op.path);
+      this.ignorePaths.delete(renamed);
+      throw error;
+    }
+    this.ctx.setJournalEntry(op.path, null);
+    this.markJournalDirty();
+    summary.conflicts++;
+    this.ctx.notify(
+      `Case collision: "${op.path}" and another file differ only by letter case \u2014 renamed to "${renamed}" so both are kept.`,
+      12e3
     );
   }
   async doDeleteLocal(op, summary) {
@@ -808,77 +1376,383 @@ Both versions kept \u2014 local copy saved as: ${conflictPath}`,
     this.markJournalDirty();
     summary.deletedRemote++;
   }
-  // ------------------------------------------------------------- plumbing
-  async ensureSetup() {
+  // ---------------------------------------------------- integrity audit (PROB-10)
+  /** Result of a full-store integrity verification. */
+  async verifyIntegrity() {
+    var _a;
     const settings = this.ctx.getSettings();
+    const password = (_a = this.passwordOverride) != null ? _a : settings.encryptionPassword;
+    if (!settings.serverUrl || !settings.apiToken || !password) {
+      this.ctx.notify("E2EE Sync: set server URL, API token and E2EE password first.");
+      return null;
+    }
+    try {
+      const api = this.ensureApi(settings);
+      const { index } = await api.getIndex();
+      const setup = await this.ensureSetup(api, password, index);
+      const targets = Object.entries(index.files).filter(([p, f]) => f && !f.deleted && !isVerifierPath(canonicalPath(p))).map(([key, info]) => ({ key, path: canonicalPath(key), info }));
+      const report = {
+        checked: 0,
+        hashMismatch: [],
+        decryptFailed: [],
+        failures: []
+      };
+      await this.runPool(targets, 3, async ({ key, path, info }) => {
+        try {
+          const blob = await api.download(key);
+          report.checked++;
+          if (await sha256Hex(new Uint8Array(blob)) !== info.hash) {
+            report.hashMismatch.push(path);
+            return;
+          }
+          if (info.manifest && info.manifest.length === 64) {
+            await setup.crypto.decryptChunked(blob, path, hexToBytes(info.manifest));
+          } else {
+            await setup.crypto.decrypt(blob, path);
+          }
+        } catch (error) {
+          if (error instanceof CryptoError) report.decryptFailed.push(path);
+          else report.failures.push({ path, error: errorMessage(error) });
+        }
+      });
+      return report;
+    } catch (error) {
+      this.ctx.notify(`E2EE Sync: integrity verification failed \u2014 ${errorMessage(error)}`, 8e3);
+      return null;
+    }
+  }
+  /**
+   * Re-push the intact local copies of the given paths (ver + 1), repairing
+   * server-side damage detected by verifyIntegrity. Paths without a healthy
+   * local file are skipped and reported.
+   */
+  async repairPaths(paths) {
+    var _a;
+    const settings = this.ctx.getSettings();
+    const password = (_a = this.passwordOverride) != null ? _a : settings.encryptionPassword;
+    const api = this.ensureApi(settings);
+    const meta = await api.getMeta();
+    const salt = await saltFromVaultId(meta.vaultId);
+    const cryptoMgr = new CryptoManager(password, salt);
+    const km = await cryptoMgr.keyMaterial(salt);
+    const setup = { api, crypto: cryptoMgr, salt, keyIdHex: toHex(km.keyId) };
+    const repaired = [];
+    const skipped = [];
+    await this.runPool(paths, 2, async (path) => {
+      var _a2;
+      try {
+        const file = this.ctx.app.vault.getAbstractFileByPath(path);
+        if (!(file instanceof import_obsidian2.TFile)) {
+          skipped.push(path);
+          return;
+        }
+        const plaintext = await this.ctx.app.vault.readBinary(file);
+        const record = this.ctx.getJournal()[path];
+        const version = ((_a2 = record == null ? void 0 : record.remoteVersion) != null ? _a2 : 0) + 1;
+        const uploaded = await this.encryptAndUpload(setup, path, plaintext, file.stat.mtime, version);
+        this.ctx.setJournalEntry(path, {
+          localMtime: file.stat.mtime,
+          remoteHash: uploaded.hash,
+          remoteMtime: uploaded.mtime,
+          remoteVersion: version
+        });
+        this.markJournalDirty();
+        repaired.push(path);
+      } catch (e) {
+        skipped.push(path);
+      }
+    });
+    await this.flushJournal(true);
+    return { repaired, skipped };
+  }
+  // ---------------------------------------------------- password rotation
+  /**
+   * PROB-1 — rotate the vault's E2EE password without bricking sync:
+   *  1. verify the OLD password against the current verifier (fail-closed,
+   *     nothing is modified on a mismatch),
+   *  2. seed a verifier for the new key (both coexist),
+   *  3. re-encrypt and re-push every live file under the new key, version
+   *     counters carrying over (+1),
+   *  4. once every live entry carries the new keyId, remove the old verifier.
+   * The journal survives — version counters, not hashes, carry the history.
+   * Interrupted rotations are resumable: files already under the new key are
+   * skipped when the same rotation is rerun.
+   */
+  async rotatePassword(oldPassword, newPassword) {
+    var _a, _b, _c;
+    if (oldPassword === newPassword) {
+      throw new Error("The new E2EE password must differ from the current one.");
+    }
+    if (this.rotating) throw new Error("A password rotation is already in progress.");
+    this.rotating = true;
+    try {
+      const settings = this.ctx.getSettings();
+      const api = this.ensureApi(settings);
+      const meta = await api.getMeta();
+      const salt = await saltFromVaultId(meta.vaultId);
+      const oldManager = new CryptoManager(oldPassword, salt);
+      const oldKm = await oldManager.keyMaterial(salt);
+      const oldHex = toHex(oldKm.keyId);
+      const newManager = new CryptoManager(newPassword, salt);
+      const newKm = await newManager.keyMaterial(salt);
+      const newHex = toHex(newKm.keyId);
+      const oldSetup = {
+        api,
+        crypto: oldManager,
+        salt,
+        keyIdHex: oldHex
+      };
+      const { index } = await api.getIndex();
+      await this.checkVerifier(oldSetup, index);
+      const probeEntry = Object.entries(index.files).find(
+        ([p, f]) => f && !f.deleted && !isVerifierPath(canonicalPath(p))
+      );
+      if (probeEntry && probeEntry[1].keyId !== "" && probeEntry[1].keyId !== oldHex) {
+        throw new Error(
+          "The current password does not match this vault (files carry a different key id). Rotation aborted before any change."
+        );
+      }
+      if (probeEntry && !probeEntry[1].keyId) {
+        const blob = await api.download(probeEntry[0]);
+        try {
+          await oldManager.decrypt(blob, canonicalPath(probeEntry[0]));
+        } catch (e) {
+          throw new Error(
+            "The current password does not match this vault (probe file failed to decrypt). Rotation aborted before any change."
+          );
+        }
+      }
+      const newSetup = {
+        api,
+        crypto: newManager,
+        salt,
+        keyIdHex: newHex
+      };
+      await this.seedVerifier(newSetup);
+      const remoteFiles = Object.entries(index.files).filter(
+        ([p, f]) => f && !f.deleted && !isVerifierPath(canonicalPath(p))
+      );
+      let done = 0;
+      for (const [rawKey, entry] of remoteFiles) {
+        const path = canonicalPath(rawKey);
+        if (entry.keyId === newHex) {
+          done++;
+          continue;
+        }
+        const blob = await api.download(rawKey);
+        const actualHash = await sha256Hex(new Uint8Array(blob));
+        if (actualHash !== entry.hash) {
+          throw new Error(
+            `Integrity check failed for ${path} during rotation \u2014 the server index and stored bytes disagree. Rotation aborted; nothing was overwritten.`
+          );
+        }
+        const manifest = entry.manifest && entry.manifest.length === 64 ? entry.manifest : null;
+        let plaintext;
+        if (manifest) {
+          plaintext = (await oldManager.decryptChunked(blob, path, hexToBytes(manifest))).plaintext;
+        } else {
+          plaintext = (await oldManager.decrypt(blob, path)).plaintext;
+        }
+        const record = this.ctx.getJournal()[path];
+        const version = Math.max((_a = record == null ? void 0 : record.remoteVersion) != null ? _a : 0, (_b = entry.ver) != null ? _b : 0) + 1;
+        const uploaded = await this.encryptAndUpload(newSetup, path, plaintext, Date.now(), version);
+        this.ctx.setJournalEntry(path, {
+          localMtime: (_c = record == null ? void 0 : record.localMtime) != null ? _c : Date.now(),
+          remoteHash: uploaded.hash,
+          remoteMtime: uploaded.mtime,
+          remoteVersion: version
+        });
+        this.markJournalDirty();
+        done++;
+        if (done % 10 === 0 || done === remoteFiles.length) {
+          this.ctx.setStatus("syncing", `rotating keys \u2014 ${done}/${remoteFiles.length} files`);
+          await this.flushJournal();
+        }
+      }
+      const { index: fresh } = await api.getIndex();
+      const stale = Object.entries(fresh.files).filter(
+        ([p, f]) => f && !f.deleted && !isVerifierPath(canonicalPath(p)) && f.keyId !== newHex
+      );
+      if (stale.length === 0) {
+        for (const oldPath of [verifierPathFor(oldHex), VERIFIER_LEGACY_PATH]) {
+          try {
+            await api.deleteFile(oldPath);
+          } catch (error) {
+            if (!(error instanceof ApiError) || error.status !== 404) throw error;
+          }
+        }
+        this.ctx.notify(
+          `E2EE password rotated: ${done} file(s) re-encrypted. Enter the same new password on every other device when prompted.`,
+          12e3
+        );
+      } else {
+        this.ctx.notify(
+          `E2EE password rotation left ${stale.length} file(s) under the old key (they decrypt with the old password only). Run the rotation again from this device to finish converting them.`,
+          15e3
+        );
+      }
+      this.passwordOverride = newPassword;
+      this.invalidateCrypto();
+      this.lastIndexEtag = "";
+      await this.flushJournal(true);
+    } finally {
+      this.rotating = false;
+    }
+  }
+  // ------------------------------------------------------------- plumbing
+  ensureApi(settings) {
     const signature = `${settings.serverUrl}\0${settings.apiToken}`;
     if (!this.api || this.apiSignature !== signature) {
       this.api = new SyncApi(settings.serverUrl, settings.apiToken);
       this.apiSignature = signature;
     }
-    const meta = await this.api.getMeta();
-    if (!this.crypto || this.cryptoPassword !== settings.encryptionPassword || this.vaultId !== meta.vaultId) {
+    return this.api;
+  }
+  async ensureSetup(api, password, index) {
+    var _a;
+    const meta = await api.getMeta();
+    if (!this.crypto || this.cryptoPassword !== password || this.vaultId !== meta.vaultId) {
       const salt2 = await saltFromVaultId(meta.vaultId);
       this.salt = salt2;
-      this.crypto = new CryptoManager(settings.encryptionPassword, salt2);
-      this.cryptoPassword = settings.encryptionPassword;
+      this.crypto = new CryptoManager(password, salt2);
+      this.cryptoPassword = password;
       this.vaultId = meta.vaultId;
+      const km = await this.crypto.keyMaterial(salt2);
+      this.keyIdHex = toHex(km.keyId);
     }
     const salt = this.salt;
     if (!salt || !this.crypto) throw new Error("Crypto setup failed unexpectedly.");
-    const setup = { api: this.api, crypto: this.crypto, salt };
-    await this.ensurePasswordVerifier(setup);
-    return setup;
+    const setup = { api, crypto: this.crypto, salt, keyIdHex: this.keyIdHex };
+    await this.ensurePasswordVerifier(setup, index);
+    return {
+      api,
+      crypto: this.crypto,
+      salt: (_a = this.salt) != null ? _a : salt,
+      keyIdHex: this.keyIdHex
+    };
   }
   /**
-   * Fail-closed key check: refuse to touch vault data unless this device's
-   * password decrypts the vault verifier stored at a reserved server path.
-   * This is what stops a wrongly-configured second device from overwriting
-   * the whole store with ciphertext nobody else can decrypt. A verifier
-   * mis-seeded onto an otherwise EMPTY server may be re-created; on a
-   * non-empty vault a mismatch is fatal.
+   * Fail-closed key check built on per-key verifiers (PROB-1):
+   *
+   *  - our verifier present + decrypts  -> current key, proceed;
+   *  - our verifier absent, a legacy 0.2.0 verifier decrypts -> pre-v3 vault,
+   *    upgrade by seeding our per-key verifier;
+   *  - verifiers exist for keys we do not know -> the password was rotated on
+   *    another device (or is wrong): recoverable prompt, then one retry with
+   *    the supplied password;
+   *  - a legacy verifier exists but does NOT decrypt -> genuinely wrong
+   *    password against a 0.2.0 vault: fatal (nothing is seeded, nothing is
+   *    modified) — the 0.2.0 anti-clobber guarantee is preserved;
+   *  - populated vault with no verifiers at all (0.1.x-era data), or an empty
+   *    vault -> seed our verifier.
    */
-  async ensurePasswordVerifier(setup) {
-    let packet = null;
+  async ensurePasswordVerifier(setup, index) {
     try {
-      packet = await setup.api.download(VERIFIER_PATH);
+      await this.checkVerifier(setup, index);
+      return;
     } catch (error) {
-      if (!(error instanceof ApiError) || error.status !== 404) throw error;
+      if (!(error instanceof CryptoError)) throw error;
+      const reason = /changed on another device/.test(error.message) ? "changed" : "wrong";
+      const prompted = await this.promptForNewPassword(reason);
+      if (!prompted) throw error;
     }
-    if (packet) {
-      let matches = false;
+    const salt = this.salt;
+    const crypto = this.crypto;
+    if (!salt || !crypto) throw new Error("Crypto setup failed unexpectedly.");
+    const freshSetup = {
+      api: setup.api,
+      crypto,
+      salt,
+      keyIdHex: this.keyIdHex
+    };
+    const { index: freshIndex } = await setup.api.getIndex();
+    await this.checkVerifier(freshSetup, freshIndex);
+  }
+  /** Ask the user for the current vault password (rotation on another device). */
+  async promptForNewPassword(reason) {
+    if (!this.ctx.promptPassword) return false;
+    const settings = this.ctx.getSettings();
+    const api = this.ensureApi(settings);
+    const password = await this.ctx.promptPassword(reason);
+    if (!password) return false;
+    this.passwordOverride = password;
+    this.invalidateCrypto();
+    const meta = await api.getMeta();
+    const salt = await saltFromVaultId(meta.vaultId);
+    this.salt = salt;
+    this.crypto = new CryptoManager(password, salt);
+    this.cryptoPassword = password;
+    this.vaultId = meta.vaultId;
+    const km = await this.crypto.keyMaterial(salt);
+    this.keyIdHex = toHex(km.keyId);
+    return true;
+  }
+  /** Verifier check + seeding; throws CryptoError with the classified reason. */
+  async checkVerifier(setup, index) {
+    const ourPath = verifierPathFor(setup.keyIdHex);
+    const decrypts = async (path) => {
+      let packet;
       try {
-        const plain = new Uint8Array(await setup.crypto.decrypt(packet, VERIFIER_PATH));
-        matches = plain.length === VERIFIER_PLAINTEXT.length && bytesEqual(plain, VERIFIER_PLAINTEXT);
+        packet = await setup.api.download(path);
       } catch (error) {
-        if (error instanceof CryptoError) {
-          matches = false;
-        } else {
-          throw error;
-        }
+        if (error instanceof ApiError && error.status === 404) return "missing";
+        throw error;
       }
-      if (matches) return;
-      const index = await setup.api.getIndex();
-      const liveFiles = Object.entries(index.files).filter(
-        ([p, f]) => canonicalPath(p) !== VERIFIER_PATH && f && !f.deleted
-      ).length;
-      if (liveFiles > 0) {
-        throw new CryptoError(
-          "Wrong E2EE password for this vault (verifier check failed). Correct it in the plugin settings before syncing \u2014 nothing was changed on the server."
-        );
+      try {
+        const { plaintext } = await setup.crypto.decrypt(packet, path);
+        const plain = new Uint8Array(plaintext);
+        return plain.length === VERIFIER_PLAINTEXT.length && bytesEqual(plain, VERIFIER_PLAINTEXT) ? "yes" : "no";
+      } catch (error) {
+        if (error instanceof CryptoError) return "no";
+        throw error;
+      }
+    };
+    if (await decrypts(ourPath) === "yes") return;
+    const otherVerifiers = [];
+    let liveForeign = 0;
+    let liveFiles = 0;
+    for (const [p, f] of Object.entries(index.files)) {
+      if (!f) continue;
+      const canon = canonicalPath(p);
+      if (isVerifierPath(canon)) {
+        if (canon !== ourPath) otherVerifiers.push(canon);
+        continue;
+      }
+      if (!f.deleted) {
+        liveFiles++;
+        if (f.keyId && f.keyId !== setup.keyIdHex) liveForeign++;
       }
     }
-    const seeded = await setup.crypto.encrypt(
+    if (otherVerifiers.length > 0 || liveForeign > 0) {
+      throw new CryptoError(
+        "The E2EE password was changed on another device (or this password is wrong). Enter the current password to continue syncing."
+      );
+    }
+    const legacy = await decrypts(VERIFIER_LEGACY_PATH);
+    if (legacy === "yes") {
+      await this.seedVerifier(setup);
+      return;
+    }
+    if (legacy === "no") {
+      throw new CryptoError(
+        "Wrong E2EE password for this vault (verifier check failed). Correct it in the plugin settings before syncing \u2014 nothing was changed on the server."
+      );
+    }
+    await this.seedVerifier(setup);
+  }
+  /** Create (or refresh) the verifier entry for the setup's key. */
+  async seedVerifier(setup) {
+    const path = verifierPathFor(setup.keyIdHex);
+    const packet = await setup.crypto.encrypt(
       VERIFIER_PLAINTEXT.buffer,
       setup.salt,
-      VERIFIER_PATH
+      path,
+      1
     );
-    await setup.api.upload(
-      VERIFIER_PATH,
-      seeded,
-      Date.now(),
-      await sha256Hex(new Uint8Array(seeded))
-    );
+    await setup.api.upload(path, packet, Date.now(), await sha256Hex(new Uint8Array(packet)), {
+      keyId: setup.keyIdHex,
+      fileVersion: 1
+    });
   }
   beginIgnore(path) {
     this.ignorePaths.add(path);
@@ -902,25 +1776,30 @@ Both versions kept \u2014 local copy saved as: ${conflictPath}`,
       const entry = this.ctx.app.vault.getAbstractFileByPath(current);
       if (entry instanceof import_obsidian2.TFolder) continue;
       if (entry) throw new Error(`'${current}' exists and is not a folder.`);
-      await this.ctx.app.vault.createFolder(current);
+      try {
+        await this.ctx.app.vault.createFolder(current);
+      } catch (e) {
+        const raced = this.ctx.app.vault.getAbstractFileByPath(current);
+        if (!(raced instanceof import_obsidian2.TFolder)) throw new Error(`'${current}' exists and is not a folder.`);
+      }
     }
   }
   conflictStamp(d = /* @__PURE__ */ new Date()) {
     const pad = (n) => String(n).padStart(2, "0");
     return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}`;
   }
-  /** filename.md -> filename_conflict_YYYY-MM-DD_HH-mm-ss.md */
-  uniqueConflictPath(original) {
+  /** filename.md -> filename<marker>YYYY-MM-DD_HH-mm-ss[_N].md */
+  uniqueConflictPath(original, marker = "_conflict_") {
     const slash = original.lastIndexOf("/");
     const dir = slash >= 0 ? original.slice(0, slash + 1) : "";
     const name = slash >= 0 ? original.slice(slash + 1) : original;
     const dot = name.lastIndexOf(".");
     const base = dot > 0 ? name.slice(0, dot) : name;
     const ext = dot > 0 ? name.slice(dot) : "";
-    let candidate = `${dir}${base}_conflict_${this.conflictStamp()}${ext}`;
+    let candidate = `${dir}${base}${marker}${this.conflictStamp()}${ext}`;
     let attempt = 2;
     while (this.ctx.app.vault.getAbstractFileByPath(candidate)) {
-      candidate = `${dir}${base}_conflict_${this.conflictStamp()}_${attempt++}${ext}`;
+      candidate = `${dir}${base}${marker}${this.conflictStamp()}_${attempt++}${ext}`;
     }
     return candidate;
   }
@@ -979,7 +1858,7 @@ var E2eeSyncSettingTab = class extends import_obsidian3.PluginSettingTab {
           },
           {
             name: "E2EE password",
-            desc: "Derives the encryption key (PBKDF2, 210 000 iterations). Never sent to the server. All devices syncing this vault must use the same password \u2014 changing it re-encrypts and re-uploads every file on the next sync.",
+            desc: "Derives the encryption key (PBKDF2, 210 000 iterations). Never sent to the server. All devices syncing this vault must use the same password \u2014 changing it starts a streamed key rotation (every file is re-encrypted and re-uploaded; other devices are prompted for the new password).",
             control: {
               type: "secret",
               key: "encryptionPassword"
@@ -1039,13 +1918,14 @@ var E2eeSyncSettingTab = class extends import_obsidian3.PluginSettingTab {
     const plugin = this.plugin;
     if (key === "encryptionPassword") {
       const password = String(value != null ? value : "");
+      const oldPassword = plugin.effectivePassword;
       if (plugin.settings.rememberEncryptionPassword) {
         plugin.settings.encryptionPassword = password;
       } else {
         plugin.sessionPassword = password;
         plugin.settings.encryptionPassword = "";
       }
-      await plugin.onEncryptionPasswordChanged();
+      await plugin.onEncryptionPasswordChanged(oldPassword);
       return;
     }
     if (key === "rememberEncryptionPassword") {
@@ -1173,6 +2053,40 @@ var PasswordPromptModal = class extends import_obsidian4.Modal {
     super.onClose();
   }
 };
+var IntegrityReportModal = class extends import_obsidian4.Modal {
+  constructor(app, hashMismatch, decryptFailed, otherFailures, onAction) {
+    super(app);
+    this.hashMismatch = hashMismatch;
+    this.decryptFailed = decryptFailed;
+    this.otherFailures = otherFailures;
+    this.onAction = onAction;
+  }
+  onOpen() {
+    this.titleEl.setText("E2EE Sync: integrity problems found");
+    const list = (title, items) => {
+      if (items.length === 0) return;
+      this.contentEl.createEl("h4", { text: `${title} (${items.length})` });
+      const ul = this.contentEl.createEl("ul");
+      for (const item of items.slice(0, 20)) ul.createEl("li", { text: item });
+      if (items.length > 20) ul.createEl("li", { text: `\u2026 and ${items.length - 20} more` });
+    };
+    list("Stored bytes do not match the server index (rollback or corruption)", this.hashMismatch);
+    list("Cannot be decrypted with this device\u2019s key (wrong password or foreign key)", this.decryptFailed);
+    list("Other failures", this.otherFailures);
+    this.contentEl.createEl("p", {
+      text: "Repair re-uploads the intact local copy of every affected file (version history advances by one). Files without a healthy local copy are skipped."
+    });
+    const row = this.contentEl.createEl("div", { cls: "modal-button-container" });
+    const close = row.createEl("button", { text: "Close" });
+    const repair = row.createEl("button", { text: "Repair from local copies", cls: "mod-warning" });
+    const done = (value) => {
+      this.close();
+      void this.onAction(value);
+    };
+    close.onclick = () => done(false);
+    repair.onclick = () => done(true);
+  }
+};
 var E2eeSyncPlugin = class extends import_obsidian4.Plugin {
   constructor() {
     super(...arguments);
@@ -1191,15 +2105,16 @@ var E2eeSyncPlugin = class extends import_obsidian4.Plugin {
     return this.settings.rememberEncryptionPassword ? this.settings.encryptionPassword : this.sessionPassword;
   }
   async onload() {
-    var _a, _b, _c;
+    var _a, _b, _c, _d;
     const data = (_a = await this.loadData()) != null ? _a : {};
     this.settings = { ...DEFAULT_SETTINGS, ...(_b = data.settings) != null ? _b : {} };
     this.journal = (_c = data.journal) != null ? _c : {};
     for (const key of Object.keys(this.journal)) {
       const canonical = canonicalPath(key);
-      if (canonical !== key) {
-        const record = this.journal[key];
-        delete this.journal[key];
+      const record = this.journal[key];
+      delete this.journal[key];
+      if (record) {
+        (_d = record.remoteVersion) != null ? _d : record.remoteVersion = 0;
         if (!this.journal[canonical]) this.journal[canonical] = record;
       }
     }
@@ -1219,7 +2134,8 @@ var E2eeSyncPlugin = class extends import_obsidian4.Plugin {
         "E2EE Sync: mass deletion detected",
         `The server reports ${deletedCount} of your ${localCount} files as deleted. This can mean another device cleaned the vault \u2014 or that the server (or API token) was compromised. "Keep my local files" cancels these deletions; the kept files are re-uploaded on the next sync, so nothing is lost either way.`,
         "Delete as instructed"
-      )
+      ),
+      promptPassword: (reason) => this.promptForChangedPassword(reason)
     });
     this.addSettingTab(new E2eeSyncSettingTab(this.app, this));
     this.ribbonEl = this.addRibbonIcon("refresh-cw", "E2EE Sync: sync now", () => {
@@ -1235,6 +2151,11 @@ var E2eeSyncPlugin = class extends import_obsidian4.Plugin {
       id: "enter-session-password",
       name: "Enter the E2EE password for this session",
       callback: () => this.promptForSessionPassword()
+    });
+    this.addCommand({
+      id: "verify-vault-integrity",
+      name: "Verify vault integrity",
+      callback: () => this.runIntegrityCheck()
     });
     this.app.workspace.onLayoutReady(() => this.onLayoutReady());
     this.updateStatus("idle");
@@ -1258,20 +2179,90 @@ var E2eeSyncPlugin = class extends import_obsidian4.Plugin {
     await this.saveData({ settings, journal: this.journal });
   }
   /**
-   * A changed password means every existing journal record is meaningless (the
-   * remote ciphertext was produced with a different key). Reset the journal so
-   * the next sync re-encrypts and re-uploads everything from this device.
-   * (With the password verifier in place, a genuinely wrong password is
-   * rejected before any upload; this reset only runs for intentional changes.)
+   * PROB-1: a password change no longer resets the journal — it streams a
+   * coordinated rotation (seed new verifier → re-encrypt every live file with
+   * version counters carried over → drop the old verifier). Other devices are
+   * prompted for the new password on their next sync. The journal survives.
    */
-  async onEncryptionPasswordChanged() {
-    this.engine.invalidateCrypto();
-    this.journal = {};
-    await this.saveSettings();
-    new import_obsidian4.Notice(
-      "E2EE password changed. Every file will be re-encrypted and re-uploaded on the next sync \u2014 run it first on the device with the most up-to-date vault.",
-      12e3
+  async onEncryptionPasswordChanged(oldPassword) {
+    const newPassword = this.effectivePassword;
+    if (!oldPassword || oldPassword === newPassword) {
+      await this.saveSettings();
+      return;
+    }
+    const confirmed = await confirmDialog(
+      this.app,
+      "E2EE Sync: rotate the vault encryption key?",
+      "Every file on the server will be downloaded, re-encrypted with the new password and re-uploaded (version history is preserved). Run this on the most up-to-date device first; other devices will ask for the new password on their next sync. Keep the device awake until the rotation finishes.",
+      "Rotate now"
     );
+    if (!confirmed) {
+      if (this.settings.rememberEncryptionPassword) {
+        this.settings.encryptionPassword = oldPassword;
+      } else {
+        this.sessionPassword = oldPassword;
+        this.settings.encryptionPassword = "";
+      }
+      await this.saveSettings();
+      new import_obsidian4.Notice("E2EE Sync: rotation cancelled \u2014 the previous password stays in force.", 8e3);
+      return;
+    }
+    this.updateStatus("syncing", "rotating encryption keys\u2026");
+    try {
+      await this.engine.rotatePassword(oldPassword, newPassword);
+      this.updateStatus("synced");
+      this.setAutoSync(this.settings.autoSyncMinutes);
+      this.engine.requestSync();
+    } catch (error) {
+      if (this.settings.rememberEncryptionPassword) {
+        this.settings.encryptionPassword = oldPassword;
+      } else {
+        this.sessionPassword = oldPassword;
+        this.settings.encryptionPassword = "";
+      }
+      await this.saveSettings();
+      this.updateStatus("error", errorMessage(error));
+      new import_obsidian4.Notice(`E2EE Sync: rotation failed \u2014 ${errorMessage(error)}`, 12e3);
+    }
+  }
+  /** Engine callback: verifiers of unknown keys exist — the password changed elsewhere. */
+  async promptForChangedPassword(reason) {
+    const app = this.app;
+    const title = reason === "changed" ? "E2EE Sync: the E2EE password was changed on another device" : "E2EE Sync: this E2EE password does not match the vault";
+    return new Promise((resolve) => {
+      new class extends import_obsidian4.Modal {
+        constructor() {
+          super(app);
+        }
+        onOpen() {
+          this.titleEl.setText(title);
+          this.contentEl.createEl("p", {
+            text: "Enter the current E2EE password to unlock sync for this vault. Nothing is uploaded until the password is confirmed against the server verifier."
+          });
+          const input = this.contentEl.createEl("input", { type: "password" });
+          input.placeholder = "Current E2EE password";
+          const row = this.contentEl.createEl("div", { cls: "modal-button-container" });
+          const cancel = row.createEl("button", { text: "Not now" });
+          const unlock = row.createEl("button", { text: "Unlock sync", cls: "mod-cta" });
+          const submit = () => {
+            this.close();
+            resolve(input.value || null);
+          };
+          cancel.onclick = () => {
+            this.close();
+            resolve(null);
+          };
+          unlock.onclick = submit;
+          input.addEventListener("keydown", (evt) => {
+            if (evt.key === "Enter") submit();
+          });
+          window.setTimeout(() => input.focus(), 50);
+        }
+        onClose() {
+          super.onClose();
+        }
+      }().open();
+    });
   }
   // ------------------------------------------------------------- syncing
   requestManualSync() {
@@ -1284,6 +2275,45 @@ var E2eeSyncPlugin = class extends import_obsidian4.Plugin {
       return;
     }
     void this.engine.runFullSync();
+  }
+  /** PROB-10: verify every remote entry (hash + decryptability), offer repair. */
+  async runIntegrityCheck() {
+    if (!this.settings.serverUrl || !this.settings.apiToken || !this.effectivePassword) {
+      new import_obsidian4.Notice("E2EE Sync: configure the plugin before verifying integrity.", 6e3);
+      return;
+    }
+    this.updateStatus("syncing", "verifying vault integrity\u2026");
+    const report = await this.engine.verifyIntegrity();
+    if (!report) {
+      this.updateStatus("error", "integrity verification failed");
+      return;
+    }
+    const issues = [...report.hashMismatch, ...report.decryptFailed];
+    if (issues.length === 0 && report.failures.length === 0) {
+      this.updateStatus("synced");
+      new import_obsidian4.Notice(
+        `\u2705 E2EE Sync: integrity verified \u2014 ${report.checked} file(s) checked, no problems found.`,
+        8e3
+      );
+      return;
+    }
+    this.updateStatus("error", `${issues.length} integrity problem(s)`);
+    new IntegrityReportModal(
+      this.app,
+      report.hashMismatch,
+      report.decryptFailed,
+      report.failures.map((f) => `${f.path} \u2014 ${f.error}`),
+      async (repair) => {
+        if (!repair) return;
+        this.updateStatus("syncing", "repairing\u2026");
+        const { repaired, skipped } = await this.engine.repairPaths(issues);
+        this.updateStatus(repaired.length > 0 ? "synced" : "error");
+        new import_obsidian4.Notice(
+          `E2EE Sync: repaired ${repaired.length} file(s) from local copies` + (skipped.length > 0 ? `; ${skipped.length} skipped (no intact local copy: ${skipped.slice(0, 3).join(", ")}\u2026)` : "."),
+          12e3
+        );
+      }
+    ).open();
   }
   /** Ask for the password when session-only mode has nothing in memory. */
   promptForSessionPassword() {
