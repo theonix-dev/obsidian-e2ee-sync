@@ -25,7 +25,14 @@ Standing principles every solution must respect:
 
 # Section A — Problems in the current code (fix now, in this order)
 
+> **Status (2026-11-06): Section A is complete — all ten items (PROB-1…10)
+> solved and verified in 0.3.0.** Each entry below carries its own status
+> line with the shipped design and its verification evidence. Section B
+> (IMP-1…8) remains the active queue.
+
 ## PROB-1 · Changing the password permanently bricks sync — **P0 · L**
+
+**Status:** ✅ SOLVED in 0.3.0 — packet v3 + streamed rotation (`syncEngine.rotatePassword`), per-key verifiers `.e2ee-verifier.<keyId>`, journal preserved, resumable rotations, password prompt on other devices. Verified: e2e `[10]`, crypto/planSync specs. *Shipped deviation:* the v3 header adds `ctLen`+`chunkIndex` fields beyond the sketch below (self-delimiting concatenations), and the layout lives in `plugin/src/crypto.ts`.*
 
 **What is wrong.** In 0.2.0 a legitimate password change is fatal. The user
 changes the password in settings (`onEncryptionPasswordChanged` resets the
@@ -89,6 +96,8 @@ older clients unaffected.
 
 ## PROB-2 · Full-state rollback is undetectable — **P1 · (ships with PROB-1)**
 
+**Status:** ✅ SOLVED in 0.3.0 — authenticated per-file version counters (`rollbackReason` pure policy, journal `remoteVersion`). Verified: e2e `[11]`, crypto.spec `[9]`.
+
 **What is wrong.** Hash verification (0.2.0) compares downloaded bytes to the
 index entry — but the index itself is served by the untrusted server. A
 compromised server can serve a *consistent old snapshot* (old index + old
@@ -112,6 +121,8 @@ files and for whole-snapshot restores alike.
 server back to them, client must refuse with a version-mismatch error.
 
 ## PROB-3 · Large files: hard 256 MB ceiling and huge RAM spikes — **P1 · L**
+
+**Status:** ✅ SOLVED in 0.3.0 — `/api/upload/begin|chunk|status|commit`, 8 MiB client chunks, resume via status, per-chunk hash verification, `MAX_FILE_BYTES` 2 GiB, staging sweep. Verified: e2e `[7]` (70 MB/4 chunks, corruption, resume, gap, caps, RSS smoke), bench `[12]`. *Shipped deviations:* `fileManifest` is computed over PLAINTEXT chunk hashes (ciphertext hashes in the AAD are circular), and per-chunk ciphertext hashes travel on each PUT (`X-Chunk-Hash`) instead of being declared at `begin` — both keep client memory bounded to ~one chunk.*
 
 **What is wrong.** Two coupled defects:
 1. Files > 256 MB cannot sync at all (`MAX_SYNCABLE_BYTES` refusal; the
@@ -156,6 +167,8 @@ peak heap stays under ~2× chunk size in the smoke harness.
 
 ## PROB-4 · Conflict handling is unproven and can silently misplan — **P1 · M**
 
+**Status:** ✅ SOLVED in 0.3.0 — `plugin/test/planSync.spec.mjs`: 50-cell decision matrix (local×record×remote×hash×version×mtime — versions and remote mtimes proven irrelevant to planning), case-collision guards both planner-level (`case-rename`) and write-time (`_remote-case_` redirect). CI runs it on every push.
+
 **What is wrong.** `planSync` decides push/pull/conflict/delete for every
 path, yet nothing enumerates its decision space. Uncovered corners include:
 case-only collisions (`note.md` vs `Note.md` — on case-insensitive
@@ -186,6 +199,8 @@ the `syncEngine.ts` header; CI runs it on every push (PROB-8).
 
 ## PROB-5 · One bearer token shared by all devices — **P2 · S**
 
+**Status:** ✅ SOLVED in 0.3.0 — `AUTH_TOKENS` (comma-separated, constant-time against every digest). Verified: e2e `[9]` (multi-token authorize, revoke one).
+
 **What is wrong.** `AUTH_TOKEN` is a single credential on every device.
 Losing any one phone (or a misconfigured backup) exposes full read/write
 control of the store; the only response is rotating the token on *all*
@@ -206,6 +221,8 @@ env and restarting → that token gets 401, the other still works.
 
 ## PROB-6 · Auto-sync burns battery: full index + full plan every interval — **P2 · S**
 
+**Status:** ✅ SOLVED in 0.3.0 — `ETag`/`If-None-Match`/`304` on `GET /api/index`; the client ends an idle cycle on 304 before planning. Verified: e2e `[8]`.
+
 **What is wrong.** Every cycle (default every 5 minutes) downloads the whole
 index and replans everything, even when nothing changed anywhere. On mobile
 this is pure cost: radio wake-ups, battery, server load.
@@ -223,6 +240,8 @@ idle cycles nearly free.)
 
 ## PROB-7 · Transfers are strictly sequential — initial sync crawls — **P3 · S**
 
+**Status:** ✅ SOLVED in 0.3.0 — `runPool`: downloads ×3, uploads (push+conflict) ×2, deletions serialized ×1; one op per path preserves ordering. Verified: e2e bench `[12]`.
+
 **What is wrong.** `executePlan` processes ops one at a time; a fresh device
 with thousands of small notes takes multiples of the necessary wall-clock
 time (per-request latency dominates), while each request is tiny.
@@ -238,6 +257,8 @@ stays bounded because payloads are ≤ 32 MB each after PROB-3.
 wall-clock scales with `ceil(N/pool)` not N, and per-path invariants hold.
 
 ## PROB-8 · Regressions ship unnoticed: no CI on ordinary pushes — **P0 (process) · S**
+
+**Status:** ✅ SOLVED in 0.3.0 — `.github/workflows/ci.yml` on push/PR to main+beta: server suite on Node 18/20/22, plugin build, bundle-cleanliness assertion, plugin specs.
 
 **What is wrong.** Tests exist (51 server assertions + crypto smoke) but
 nothing runs them automatically; a broken push to `main` or `beta` — or a
@@ -259,6 +280,8 @@ goes green.
 
 ## PROB-9 · `index.json` is a single point of recovery on the server — **P3 · S**
 
+**Status:** ✅ SOLVED in 0.3.0 — `tools/rebuild-index.mjs` (+`--dry-run`, orphan report). Verified: e2e `[14]` round-trip (rebuild ≡ original modulo ver/keyId; orphan counting; dry-run no-op).
+
 **What is wrong.** If `index.json` is lost/corrupted (disk partial failure,
 bad manual edit) while `data/files/` is intact, the server starts with an
 empty index; clients then re-upload everything (workable but expensive), and
@@ -275,6 +298,8 @@ index from disk (`sha256` + size per blob, fs `mtime`, `ver: 0`, `keyId:
 equals original modulo `ver`/`keyId` defaults.
 
 ## PROB-10 · No incident-response tooling after a suspected compromise — **P2 · S**
+
+**Status:** ✅ SOLVED in 0.3.0 — command "Verify vault integrity": hash-check + decrypt-check per live entry (pool ×3), grouped report modal, repair from intact local copies (ver+1).
 
 **What is wrong.** If a user suspects their server or a device was
 compromised, there is no supported way to answer "is my vault state
@@ -412,7 +437,8 @@ heuristic that lies.
 - Tags only on `main` (a tag push publishes a release, branch-independent);
   `beta` is the integration branch.
 - Packet versions: pulls keep reading the previous version for two minor
-  releases; pushes always write the latest (v1 read-only legacy; v2 current
-  0.2.x; v3 lands with PROB-1/2).
+  releases; pushes always write the latest (v1/v2 read-only legacy; **v3
+  current since 0.3.0**). 0.2.x devices cannot read v3 — upgrade devices
+  together.
 - Every change lands with: CHANGELOG entry, tests per its "Verification"
   line, and a green CI run (PROB-8).
