@@ -26,3 +26,6 @@ backups/
 .vscode/
 .idea/
 *.swp
+
+# Plugin spec harness build output (generated at test runtime)
+plugin/test/.build/
