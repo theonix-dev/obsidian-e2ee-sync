@@ -37,6 +37,15 @@ export interface ApiOptions {
   timeoutMs?: number;
 }
 
+/** Result of `getIndex` — carries the ETag for conditional requests (PROB-6). */
+export interface IndexResult {
+  index: RemoteIndex;
+  /** ETag returned by the server ('' when none); feed back into getIndex(). */
+  etag: string;
+  /** True when the server answered 304 Not Modified for the supplied ETag. */
+  notModified: boolean;
+}
+
 export class SyncApi {
   private readonly baseUrl: string;
   private readonly timeoutMs: number;
@@ -127,7 +136,8 @@ export class SyncApi {
       );
     }
 
-    if (response.status < 200 || response.status >= 300) {
+    // 304 Not Modified is a success for conditional GET /api/index requests.
+    if ((response.status < 200 || response.status >= 300) && response.status !== 304) {
       let detail = '';
       try {
         detail = (response.text ?? '').slice(0, MAX_ERROR_BODY_CHARS);
@@ -157,35 +167,122 @@ export class SyncApi {
     return this.parseJson(await this.request('GET', this.buildUrl('/api/meta')));
   }
 
-  /** Full server state, including tombstones. */
-  async getIndex(): Promise<RemoteIndex> {
-    const index = this.parseJson<RemoteIndex>(
-      await this.request('GET', this.buildUrl('/api/index')),
-    );
+  /**
+   * Full server state, including tombstones. When `etag` from a previous
+   * response is supplied and the index is unchanged, the server answers 304
+   * and `notModified` is true (one cheap request ends an idle sync cycle).
+   */
+  async getIndex(etag?: string): Promise<IndexResult> {
+    const headers: Record<string, string> = {};
+    if (etag) headers['If-None-Match'] = etag;
+    const response = await this.request('GET', this.buildUrl('/api/index'), { headers });
+    if (response.status === 304) {
+      return { index: { files: {} }, etag: etag ?? '', notModified: true };
+    }
+    const index = this.parseJson<RemoteIndex>(response);
     if (!index || typeof index !== 'object' || !index.files) {
       throw new ApiError('Server index response is missing the "files" map.', 0);
     }
-    return index;
+    const newEtag = this.responseHeader(response, 'etag') ?? '';
+    return { index, etag: newEtag, notModified: false };
+  }
+
+  /** Case-insensitive header lookup on a requestUrl response. */
+  private responseHeader(response: RequestUrlResponse, name: string): string | null {
+    const headers = response.headers as Record<string, string> | undefined;
+    if (!headers) return null;
+    const lower = name.toLowerCase();
+    for (const [k, v] of Object.entries(headers)) {
+      if (k.toLowerCase() === lower) return v;
+    }
+    return null;
   }
 
   /**
    * Upload an encrypted packet. Metadata travels in headers (URL-encoded path)
-   * so the body stays pure binary — no multipart overhead.
+   * so the body stays pure binary — no multipart overhead. `keyId` and
+   * `fileVersion` are echoed by the server into its index (packet v3).
    */
   async upload(
     path: string,
     ciphertext: ArrayBuffer,
     clientMtime: number,
     cipherHash: string,
+    meta?: { keyId?: string; fileVersion?: number },
   ): Promise<RemoteFileInfo> {
+    const headers: Record<string, string> = {
+      'X-File-Path': encodeURIComponent(path),
+      'X-Client-Mtime': String(Math.floor(clientMtime)),
+      'X-Cipher-Hash': cipherHash,
+    };
+    if (meta?.keyId) headers['X-Key-Id'] = meta.keyId;
+    if (meta?.fileVersion !== undefined) headers['X-File-Version'] = String(meta.fileVersion);
     const response = await this.request('POST', this.buildUrl('/api/upload'), {
       body: ciphertext,
-      headers: {
-        'X-File-Path': encodeURIComponent(path),
-        'X-Client-Mtime': String(Math.floor(clientMtime)),
-        'X-Cipher-Hash': cipherHash,
-      },
+      headers,
     });
+    return this.parseJson<RemoteFileInfo>(response);
+  }
+
+  // ------------------------------------------------ chunked transport (v3)
+
+  /** Begin a resumable chunked upload; returns the staging upload id. */
+  async beginUpload(request: {
+    path: string;
+    totalBytes: number;
+    chunkCount: number;
+    fileManifest: string; // 64-hex SHA-256 over the plaintext chunk hashes
+  }): Promise<{ uploadId: string }> {
+    const response = await this.request('POST', this.buildUrl('/api/upload/begin'), {
+      body: new TextEncoder().encode(JSON.stringify(request)).buffer as ArrayBuffer,
+      headers: { 'Content-Type': 'application/json' },
+    });
+    return this.parseJson<{ uploadId: string }>(response);
+  }
+
+  /**
+   * Upload one encrypted chunk. The server verifies the body against
+   * `chunkHash` (SHA-256 of the ciphertext chunk) and stores it as part `n`.
+   */
+  async uploadChunk(
+    uploadId: string,
+    n: number,
+    chunk: ArrayBuffer,
+    chunkHash: string,
+  ): Promise<{ accepted: number[] }> {
+    const response = await this.request(
+      'PUT',
+      this.buildUrl('/api/upload/chunk', { uploadId, n: String(n) }),
+      { body: chunk, headers: { 'X-Chunk-Hash': chunkHash } },
+    );
+    return this.parseJson<{ accepted: number[] }>(response);
+  }
+
+  /** Which chunk numbers the server already holds — the resume primitive. */
+  async uploadStatus(uploadId: string): Promise<{ accepted: number[]; chunkCount: number }> {
+    const response = await this.request(
+      'GET',
+      this.buildUrl('/api/upload/status', { uploadId }),
+    );
+    return this.parseJson<{ accepted: number[]; chunkCount: number }>(response);
+  }
+
+  /** Assemble the staged chunks into the final file and index it. */
+  async commitUpload(
+    uploadId: string,
+    meta: { clientMtime: number; keyId: string; fileVersion: number },
+  ): Promise<RemoteFileInfo> {
+    const response = await this.request(
+      'POST',
+      this.buildUrl('/api/upload/commit', { uploadId }),
+      {
+        headers: {
+          'X-Client-Mtime': String(Math.floor(meta.clientMtime)),
+          'X-Key-Id': meta.keyId,
+          'X-File-Version': String(meta.fileVersion),
+        },
+      },
+    );
     return this.parseJson<RemoteFileInfo>(response);
   }
 
@@ -206,10 +303,10 @@ export class SyncApi {
 
   /** Settings-tab helper: verifies auth + reachability, returns live file count. */
   async testConnection(): Promise<{ fileCount: number; vaultId: string }> {
-    const [meta, index] = await Promise.all([this.getMeta(), this.getIndex()]);
-    // Internal reserved entries (password verifier) are not user files.
-    const live = Object.entries(index.files).filter(
-      ([p, f]) => f && !f.deleted && !p.startsWith('.e2ee-sync-'),
+    const [meta, indexResult] = await Promise.all([this.getMeta(), this.getIndex()]);
+    // Internal reserved entries (password verifiers) are not user files.
+    const live = Object.entries(indexResult.index.files).filter(
+      ([p, f]) => f && !f.deleted && !p.startsWith('.e2ee-'),
     ).length;
     return { fileCount: live, vaultId: meta.vaultId };
   }

@@ -102,6 +102,48 @@ class PasswordPromptModal extends Modal {
   }
 }
 
+/** PROB-10: integrity report with grouped issues and a repair-all action. */
+class IntegrityReportModal extends Modal {
+  constructor(
+    app: App,
+    private readonly hashMismatch: string[],
+    private readonly decryptFailed: string[],
+    private readonly otherFailures: string[],
+    private readonly onAction: (repair: boolean) => void,
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    this.titleEl.setText('E2EE Sync: integrity problems found');
+    const list = (title: string, items: string[]) => {
+      if (items.length === 0) return;
+      this.contentEl.createEl('h4', { text: `${title} (${items.length})` });
+      const ul = this.contentEl.createEl('ul');
+      for (const item of items.slice(0, 20)) ul.createEl('li', { text: item });
+      if (items.length > 20) ul.createEl('li', { text: `… and ${items.length - 20} more` });
+    };
+    list('Stored bytes do not match the server index (rollback or corruption)', this.hashMismatch);
+    list('Cannot be decrypted with this device\u2019s key (wrong password or foreign key)', this.decryptFailed);
+    list('Other failures', this.otherFailures);
+
+    this.contentEl.createEl('p', {
+      text:
+        'Repair re-uploads the intact local copy of every affected file (version history ' +
+        'advances by one). Files without a healthy local copy are skipped.',
+    });
+    const row = this.contentEl.createEl('div', { cls: 'modal-button-container' });
+    const close = row.createEl('button', { text: 'Close' });
+    const repair = row.createEl('button', { text: 'Repair from local copies', cls: 'mod-warning' });
+    const done = (value: boolean) => {
+      this.close();
+      void this.onAction(value);
+    };
+    close.onclick = () => done(false);
+    repair.onclick = () => done(true);
+  }
+}
+
 export default class E2eeSyncPlugin extends Plugin {
   settings: PluginSettings = { ...DEFAULT_SETTINGS };
   journal: Record<string, SyncRecord> = {};
@@ -129,12 +171,14 @@ export default class E2eeSyncPlugin extends Plugin {
     this.journal = data.journal ?? {};
 
     // Migrate pre-NFC journal keys so records survive the canonicalization of
-    // paths (iOS/macOS NFD spellings now share one canonical key).
+    // paths (iOS/macOS NFD spellings now share one canonical key). Records
+    // from pre-v3 releases gain a zero version counter (no v3 packet seen).
     for (const key of Object.keys(this.journal)) {
       const canonical = canonicalPath(key);
-      if (canonical !== key) {
-        const record = this.journal[key];
-        delete this.journal[key];
+      const record = this.journal[key];
+      delete this.journal[key];
+      if (record) {
+        record.remoteVersion ??= 0;
         if (!this.journal[canonical]) this.journal[canonical] = record;
       }
     }
@@ -160,6 +204,7 @@ export default class E2eeSyncPlugin extends Plugin {
             'on the next sync, so nothing is lost either way.',
           'Delete as instructed',
         ),
+      promptPassword: (reason) => this.promptForChangedPassword(reason),
     });
 
     this.addSettingTab(new E2eeSyncSettingTab(this.app, this));
@@ -181,6 +226,12 @@ export default class E2eeSyncPlugin extends Plugin {
       id: 'enter-session-password',
       name: 'Enter the E2EE password for this session',
       callback: () => this.promptForSessionPassword(),
+    });
+
+    this.addCommand({
+      id: 'verify-vault-integrity',
+      name: 'Verify vault integrity',
+      callback: () => this.runIntegrityCheck(),
     });
 
     // Event subscriptions happen only once the vault is fully loaded,
@@ -213,21 +264,101 @@ export default class E2eeSyncPlugin extends Plugin {
   }
 
   /**
-   * A changed password means every existing journal record is meaningless (the
-   * remote ciphertext was produced with a different key). Reset the journal so
-   * the next sync re-encrypts and re-uploads everything from this device.
-   * (With the password verifier in place, a genuinely wrong password is
-   * rejected before any upload; this reset only runs for intentional changes.)
+   * PROB-1: a password change no longer resets the journal — it streams a
+   * coordinated rotation (seed new verifier → re-encrypt every live file with
+   * version counters carried over → drop the old verifier). Other devices are
+   * prompted for the new password on their next sync. The journal survives.
    */
-  async onEncryptionPasswordChanged(): Promise<void> {
-    this.engine.invalidateCrypto();
-    this.journal = {};
-    await this.saveSettings();
-    new Notice(
-      'E2EE password changed. Every file will be re-encrypted and re-uploaded on the next sync — ' +
-        'run it first on the device with the most up-to-date vault.',
-      12000,
+  async onEncryptionPasswordChanged(oldPassword: string): Promise<void> {
+    const newPassword = this.effectivePassword;
+    if (!oldPassword || oldPassword === newPassword) {
+      await this.saveSettings();
+      return;
+    }
+    const confirmed = await confirmDialog(
+      this.app,
+      'E2EE Sync: rotate the vault encryption key?',
+      'Every file on the server will be downloaded, re-encrypted with the new password and ' +
+        're-uploaded (version history is preserved). Run this on the most up-to-date device first; ' +
+        'other devices will ask for the new password on their next sync. Keep the device awake ' +
+        'until the rotation finishes.',
+      'Rotate now',
     );
+    if (!confirmed) {
+      // Declined: restore the previous password.
+      if (this.settings.rememberEncryptionPassword) {
+        this.settings.encryptionPassword = oldPassword;
+      } else {
+        this.sessionPassword = oldPassword;
+        this.settings.encryptionPassword = '';
+      }
+      await this.saveSettings();
+      new Notice('E2EE Sync: rotation cancelled — the previous password stays in force.', 8000);
+      return;
+    }
+
+    this.updateStatus('syncing', 'rotating encryption keys…');
+    try {
+      await this.engine.rotatePassword(oldPassword, newPassword);
+      this.updateStatus('synced');
+      this.setAutoSync(this.settings.autoSyncMinutes);
+      this.engine.requestSync();
+    } catch (error) {
+      // Fail-closed: restore the old password, nothing was modified.
+      if (this.settings.rememberEncryptionPassword) {
+        this.settings.encryptionPassword = oldPassword;
+      } else {
+        this.sessionPassword = oldPassword;
+        this.settings.encryptionPassword = '';
+      }
+      await this.saveSettings();
+      this.updateStatus('error', errorMessage(error));
+      new Notice(`E2EE Sync: rotation failed — ${errorMessage(error)}`, 12000);
+    }
+  }
+
+  /** Engine callback: verifiers of unknown keys exist — the password changed elsewhere. */
+  private async promptForChangedPassword(reason: 'changed' | 'wrong'): Promise<string | null> {
+    const app = this.app;
+    const title = reason === 'changed'
+      ? 'E2EE Sync: the E2EE password was changed on another device'
+      : 'E2EE Sync: this E2EE password does not match the vault';
+    return new Promise((resolve) => {
+      new (class extends Modal {
+        constructor() {
+          super(app);
+        }
+        onOpen(): void {
+          this.titleEl.setText(title);
+          this.contentEl.createEl('p', {
+            text:
+              'Enter the current E2EE password to unlock sync for this vault. ' +
+              'Nothing is uploaded until the password is confirmed against the server verifier.',
+          });
+          const input = this.contentEl.createEl('input', { type: 'password' });
+          input.placeholder = 'Current E2EE password';
+          const row = this.contentEl.createEl('div', { cls: 'modal-button-container' });
+          const cancel = row.createEl('button', { text: 'Not now' });
+          const unlock = row.createEl('button', { text: 'Unlock sync', cls: 'mod-cta' });
+          const submit = () => {
+            this.close();
+            resolve(input.value || null);
+          };
+          cancel.onclick = () => {
+            this.close();
+            resolve(null);
+          };
+          unlock.onclick = submit;
+          input.addEventListener('keydown', (evt) => {
+            if (evt.key === 'Enter') submit();
+          });
+          window.setTimeout(() => input.focus(), 50);
+        }
+        onClose(): void {
+          super.onClose();
+        }
+      })().open();
+    });
   }
 
   // ------------------------------------------------------------- syncing
@@ -242,6 +373,49 @@ export default class E2eeSyncPlugin extends Plugin {
       return;
     }
     void this.engine.runFullSync();
+  }
+
+  /** PROB-10: verify every remote entry (hash + decryptability), offer repair. */
+  private async runIntegrityCheck(): Promise<void> {
+    if (!this.settings.serverUrl || !this.settings.apiToken || !this.effectivePassword) {
+      new Notice('E2EE Sync: configure the plugin before verifying integrity.', 6000);
+      return;
+    }
+    this.updateStatus('syncing', 'verifying vault integrity…');
+    const report = await this.engine.verifyIntegrity();
+    if (!report) {
+      this.updateStatus('error', 'integrity verification failed');
+      return;
+    }
+
+    const issues = [...report.hashMismatch, ...report.decryptFailed];
+    if (issues.length === 0 && report.failures.length === 0) {
+      this.updateStatus('synced');
+      new Notice(
+        `✅ E2EE Sync: integrity verified — ${report.checked} file(s) checked, no problems found.`,
+        8000,
+      );
+      return;
+    }
+
+    this.updateStatus('error', `${issues.length} integrity problem(s)`);
+    new IntegrityReportModal(
+      this.app,
+      report.hashMismatch,
+      report.decryptFailed,
+      report.failures.map((f) => `${f.path} — ${f.error}`),
+      async (repair) => {
+        if (!repair) return;
+        this.updateStatus('syncing', 'repairing…');
+        const { repaired, skipped } = await this.engine.repairPaths(issues);
+        this.updateStatus(repaired.length > 0 ? 'synced' : 'error');
+        new Notice(
+          `E2EE Sync: repaired ${repaired.length} file(s) from local copies` +
+            (skipped.length > 0 ? `; ${skipped.length} skipped (no intact local copy: ${skipped.slice(0, 3).join(', ')}…)` : '.'),
+          12000,
+        );
+      },
+    ).open();
   }
 
   /** Ask for the password when session-only mode has nothing in memory. */

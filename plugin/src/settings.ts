@@ -54,8 +54,8 @@ export class E2eeSyncSettingTab extends PluginSettingTab {
             name: 'E2EE password',
             desc:
               'Derives the encryption key (PBKDF2, 210 000 iterations). Never sent to the server. All devices ' +
-              'syncing this vault must use the same password — changing it re-encrypts and re-uploads every ' +
-              'file on the next sync.',
+              'syncing this vault must use the same password — changing it starts a streamed key rotation ' +
+              '(every file is re-encrypted and re-uploaded; other devices are prompted for the new password).',
             control: {
               type: 'secret',
               key: 'encryptionPassword',
@@ -125,13 +125,14 @@ export class E2eeSyncSettingTab extends PluginSettingTab {
     // The E2EE password may live in memory only (session-only mode).
     if (key === 'encryptionPassword') {
       const password = String(value ?? '');
+      const oldPassword = plugin.effectivePassword; // rotation verifies against it
       if (plugin.settings.rememberEncryptionPassword) {
         plugin.settings.encryptionPassword = password;
       } else {
         plugin.sessionPassword = password;
         plugin.settings.encryptionPassword = ''; // never persisted
       }
-      await plugin.onEncryptionPasswordChanged();
+      await plugin.onEncryptionPasswordChanged(oldPassword);
       return;
     }
 

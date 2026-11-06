@@ -10,6 +10,12 @@ export interface RemoteFileInfo {
   hash: string;
   /** True when the file was deleted on another device (tombstone). */
   deleted: boolean;
+  /** 16-hex key id of the encrypting key ('' for pre-v3 entries and tombstones). */
+  keyId?: string;
+  /** Server-echoed per-file version counter (0 for pre-v3 entries and tombstones). */
+  ver?: number;
+  /** File manifest hash for chunk-assembled blobs ('' for single-shot files). */
+  manifest?: string;
 }
 
 /** Response of `GET /api/index`. */
@@ -33,6 +39,12 @@ export interface SyncRecord {
   remoteHash: string;
   /** Server mtime at that time. */
   remoteMtime: number;
+  /**
+   * Last authenticated per-file version counter seen for this path (packet v3).
+   * A remote packet with a lower counter is a server-side rollback and is
+   * refused. 0 = never seen a v3 packet for this path.
+   */
+  remoteVersion: number;
 }
 
 export type SyncStatus = 'idle' | 'syncing' | 'synced' | 'error' | 'offline';
