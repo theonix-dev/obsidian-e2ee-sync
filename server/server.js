@@ -9,27 +9,44 @@
  * encryption keys nor plaintext. It exposes:
  *
  *   GET    /api/meta                  -> { vaultId }            (stable KDF salt source)
- *   GET    /api/index                 -> full index incl. tombstones
+ *   GET    /api/index                 -> full index incl. tombstones (ETag / 304)
  *   POST   /api/upload                -> binary body + X-File-Path / X-Client-Mtime /
- *                                        X-Cipher-Hash headers; atomic tmp+rename write
+ *                                        X-Cipher-Hash [/ X-Key-Id / X-File-Version]
+ *                                        headers; atomic tmp+rename write
+ *   POST   /api/upload/begin          -> JSON {path,totalBytes,chunkCount,fileManifest}
+ *                                        opens a resumable staging upload
+ *   PUT    /api/upload/chunk?uploadId=&n= -> one ciphertext chunk (X-Chunk-Hash
+ *                                        verified), stored as a staging part
+ *   GET    /api/upload/status?uploadId=   -> accepted chunk numbers (resume)
+ *   POST   /api/upload/commit?uploadId=   -> assemble parts under the path lock,
+ *                                        hash the blob, index it, drop staging
  *   GET    /api/download?path=<enc>   -> streams the encrypted blob
  *   DELETE /api/delete?path=<enc>     -> removes the blob, keeps a tombstone in the index
  *   GET    /api/health                -> unauthenticated liveness probe
  *
- * All /api/* routes except /health require `Authorization: Bearer <AUTH_TOKEN>`
- * and are compared in constant time. Path mutations (upload/delete) are
- * serialized per path so the on-disk blob and the index can never disagree,
- * and every stored path is canonicalized to Unicode NFC (clients on iOS/macOS
- * produce NFD filenames; without a single canonical form the same logical file
- * would fork into two independent entries).
+ * All /api/* routes except /health require `Authorization: Bearer <token>` and
+ * are compared in constant time against every configured token. X-Key-Id /
+ * X-File-Version are opaque client metadata echoed into the index (packet v3:
+ * they let clients detect key rotations and rollbacks; the server cannot
+ * forge them usefully because they are authenticated inside each packet's
+ * AES-GCM AAD on the client). Path mutations (upload/delete) are serialized
+ * per path so the on-disk blob and the index can never disagree, and every
+ * stored path is canonicalized to Unicode NFC (clients on iOS/macOS produce
+ * NFD filenames; without a single canonical form the same logical file would
+ * fork into two independent entries).
  *
  * Configuration (environment variables):
- *   AUTH_TOKEN          required, >= 16 chars   bearer token clients must present
- *   PORT                default 8080
- *   HOST                default 127.0.0.1 (put nginx/TLS in front for remote access)
- *   DATA_DIR            default ./data
- *   MAX_BODY_BYTES      default 256 MiB
- *   TOMBSTONE_TTL_DAYS  default 0 (keep tombstones forever; see README before enabling GC)
+ *   AUTH_TOKEN           required, >= 16 chars   bearer token clients must present
+ *   AUTH_TOKENS          optional, comma-separated additional tokens (PROB-5:
+ *                        issue one per device; drop a lost device's token
+ *                        without re-provisioning the fleet)
+ *   PORT                 default 8080
+ *   HOST                 default 127.0.0.1 (put nginx/TLS in front for remote access)
+ *   DATA_DIR             default ./data
+ *   MAX_BODY_BYTES       default 256 MiB — per-request (per-chunk) cap
+ *   MAX_FILE_BYTES       default 2 GiB — cap for assembled chunked uploads
+ *   TOMBSTONE_TTL_DAYS   default 0 (keep tombstones forever; see README before enabling GC)
+ *   STAGING_TTL_HOURS    default 24 — sweep abandoned staging uploads older than this
  */
 
 'use strict';
@@ -47,14 +64,21 @@ const HOST = process.env.HOST || '127.0.0.1';
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data'));
 const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
 const MAX_BODY_BYTES = Number(process.env.MAX_BODY_BYTES || 256 * 1024 * 1024);
+const MAX_FILE_BYTES = Number(process.env.MAX_FILE_BYTES || 2 * 1024 * 1024 * 1024);
 const TOMBSTONE_TTL_DAYS = Number(process.env.TOMBSTONE_TTL_DAYS || 0);
+const STAGING_TTL_HOURS = Number(process.env.STAGING_TTL_HOURS || 24);
 /** Farthest future a client-supplied mtime may claim (guards the clients'
- *  first-sync "newest mtime wins" heuristic against skewed device clocks). */
+ * first-sync "newest mtime wins" heuristic against skewed device clocks). */
 const MAX_MTIME_SKEW_MS = 24 * 3600 * 1000;
+const MAX_SAFE_INTEGER = Number.MAX_SAFE_INTEGER;
 
-if (!AUTH_TOKEN || AUTH_TOKEN.length < 16) {
+const AUTH_TOKEN_LIST = [
+  ...AUTH_TOKEN.split(',').map((t) => t.trim()).filter(Boolean),
+  ...(process.env.AUTH_TOKENS || '').split(',').map((t) => t.trim()).filter(Boolean),
+];
+if (AUTH_TOKEN_LIST.length === 0 || AUTH_TOKEN_LIST.some((t) => t.length < 16)) {
   console.error(
-    '[fatal] AUTH_TOKEN is missing or shorter than 16 characters.\n' +
+    '[fatal] No AUTH_TOKEN (or all tokens are shorter than 16 characters).\n' +
       '        Generate one with:  openssl rand -hex 32\n' +
       '        Then start with:    AUTH_TOKEN=<token> node server.js',
   );
@@ -62,21 +86,27 @@ if (!AUTH_TOKEN || AUTH_TOKEN.length < 16) {
 }
 
 const FILES_DIR = path.join(DATA_DIR, 'files');
+const STAGING_DIR = path.join(DATA_DIR, 'staging');
 const META_PATH = path.join(DATA_DIR, 'meta.json');
 const INDEX_PATH = path.join(DATA_DIR, 'index.json');
 
 // ------------------------------------------------------------------ auth ----
 
-const TOKEN_DIGEST = crypto.createHash('sha256').update(AUTH_TOKEN, 'utf8').digest();
+const TOKEN_DIGESTS = AUTH_TOKEN_LIST.map((t) =>
+  crypto.createHash('sha256').update(t, 'utf8').digest(),
+);
 
 function isAuthorized(req) {
   const header = req.headers['authorization'] || '';
   const match = /^Bearer\s+(.+)$/.exec(header);
   if (!match) return false;
   // Hash both sides first: timingSafeEqual requires equal lengths and hashing
-  // avoids leaking the token length.
+  // avoids leaking the token length. Compare against every configured token
+  // so per-device tokens (PROB-5) all authorize.
   const digest = crypto.createHash('sha256').update(match[1], 'utf8').digest();
-  return digest.length === TOKEN_DIGEST.length && crypto.timingSafeEqual(digest, TOKEN_DIGEST);
+  return TOKEN_DIGESTS.some(
+    (known) => digest.length === known.length && crypto.timingSafeEqual(digest, known),
+  );
 }
 
 /** Throttle repeated auth failures per source address (memory-bounded). */
@@ -146,8 +176,26 @@ function decodePathValue(value) {
 
 /** @type {{ vaultId: string } | null} */
 let meta = null;
-/** @type {Map<string, {mtime:number,size:number,hash:string,deleted:boolean}>} */
+/**
+ * @type {Map<string, {mtime:number,size:number,hash:string,deleted:boolean,
+ *                     keyId:string,ver:number,manifest:string}>}
+ */
 const index = new Map();
+
+/**
+ * Resumable chunked uploads (PROB-3). One directory per upload under
+ * DATA_DIR/staging/<uploadId>/ holding meta.json plus <n>.part files; the
+ * in-memory map mirrors the on-disk state and is rebuilt on startup.
+ * @type {Map<string, {path:string,totalBytes:number,chunkCount:number,
+ *                     fileManifest:string,createdAt:number}>}
+ */
+const staging = new Map();
+
+function stagingDir(uploadId) {
+  // uploadId is always server-generated hex — reject anything else outright.
+  if (!/^[0-9a-f]{32}$/.test(uploadId)) throw new HttpError(400, 'Malformed uploadId.');
+  return path.join(STAGING_DIR, uploadId);
+}
 
 async function writeJsonAtomic(filePath, data) {
   const tmp = `${filePath}.${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString('hex')}.tmp`;
@@ -184,7 +232,8 @@ function withPathLock(key, fn) {
   return next;
 }
 
-/** Remove upload/persist temp files left behind by crashed requests. */
+/** Remove upload/persist temp files left behind by crashed requests, and
+ *  staging uploads abandoned for longer than STAGING_TTL_HOURS. */
 async function cleanupTmpFiles() {
   let names;
   try {
@@ -197,10 +246,34 @@ async function cleanupTmpFiles() {
       .filter((n) => n.endsWith('.tmp'))
       .map((n) => fsp.unlink(path.join(DATA_DIR, n)).catch(() => {})),
   );
+
+  // Staging sweep (PROB-3): abandoned chunked uploads must not squat on disk.
+  let stagingIds;
+  try {
+    stagingIds = await fsp.readdir(STAGING_DIR);
+  } catch {
+    stagingIds = [];
+  }
+  const cutoff = Date.now() - STAGING_TTL_HOURS * 3600_000;
+  for (const id of stagingIds) {
+    const dir = path.join(STAGING_DIR, id);
+    try {
+      const metaPath = path.join(dir, 'meta.json');
+      const stat = await fsp.stat(metaPath).catch(() => null);
+      const stale = stat ? stat.mtimeMs < cutoff : true;
+      if (stale) {
+        await fsp.rm(dir, { recursive: true, force: true });
+        staging.delete(id);
+      }
+    } catch {
+      /* best effort */
+    }
+  }
 }
 
 async function loadState() {
   await fsp.mkdir(FILES_DIR, { recursive: true, mode: 0o700 });
+  await fsp.mkdir(STAGING_DIR, { recursive: true, mode: 0o700 });
 
   try {
     meta = JSON.parse(await fsp.readFile(META_PATH, 'utf8'));
@@ -221,12 +294,40 @@ async function loadState() {
           size: Number(entry.size) || 0,
           hash: String(entry.hash || ''),
           deleted: Boolean(entry.deleted),
+          keyId: typeof entry.keyId === 'string' && /^[0-9a-f]{16}$/.test(entry.keyId) ? entry.keyId : '',
+          ver:
+            Number.isFinite(Number(entry.ver)) && Number(entry.ver) >= 0 && Number(entry.ver) <= MAX_SAFE_INTEGER
+              ? Math.floor(Number(entry.ver))
+              : 0,
+          manifest: typeof entry.manifest === 'string' && /^[0-9a-f]{64}$/.test(entry.manifest) ? entry.manifest : '',
         });
       }
     }
   } catch {
     // No index yet — start empty. Existing files on disk are not resurrected;
     // clients will re-upload whatever they still have.
+  }
+
+  // Re-attach staging uploads that survived a restart.
+  try {
+    for (const id of await fsp.readdir(STAGING_DIR)) {
+      try {
+        const m = JSON.parse(await fsp.readFile(path.join(STAGING_DIR, id, 'meta.json'), 'utf8'));
+        if (m && typeof m.path === 'string') {
+          staging.set(id, {
+            path: m.path,
+            totalBytes: Number(m.totalBytes) || 0,
+            chunkCount: Number(m.chunkCount) || 0,
+            fileManifest: String(m.fileManifest || ''),
+            createdAt: Number(m.createdAt) || Date.now(),
+          });
+        }
+      } catch {
+        await fsp.rm(path.join(STAGING_DIR, id), { recursive: true, force: true }).catch(() => {});
+      }
+    }
+  } catch {
+    /* no staging dir */
   }
 }
 
@@ -276,6 +377,47 @@ function streamBodyToFile(req, tmpPath, maxBytes) {
 
 // ---------------------------------------------------------------- routes ----
 
+/** Parse the optional packet-v3 echo headers: X-Key-Id (16 hex) and
+ *  X-File-Version (non-negative integer). Both default to ''/0. */
+function parseKeyHeaders(req) {
+  const keyId = String(req.headers['x-key-id'] ?? '').toLowerCase();
+  if (keyId !== '' && !/^[0-9a-f]{16}$/.test(keyId)) {
+    throw new HttpError(400, 'X-Key-Id must be 16 lowercase hex characters.');
+  }
+  const rawVer = req.headers['x-file-version'];
+  let ver = 0;
+  if (rawVer !== undefined && rawVer !== '') {
+    const n = Number(rawVer);
+    if (!/^\d+$/.test(String(rawVer)) || !Number.isFinite(n) || n < 0 || n > MAX_SAFE_INTEGER) {
+      throw new HttpError(400, 'X-File-Version must be a non-negative integer.');
+    }
+    ver = Math.floor(n);
+  }
+  return { keyId, ver };
+}
+
+function clampClientMtime(raw) {
+  const clientMtime = Math.floor(Number(raw));
+  return Number.isFinite(clientMtime) && clientMtime > 0
+    ? Math.min(clientMtime, Date.now() + MAX_MTIME_SKEW_MS)
+    : Date.now();
+}
+
+async function readJsonBody(req, maxBytes = 1024 * 1024) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > maxBytes) throw new HttpError(413, 'JSON body too large.');
+    chunks.push(chunk);
+  }
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  } catch {
+    throw new HttpError(400, 'Malformed JSON body.');
+  }
+}
+
 async function handleUpload(req, res, url) {
   const rawPath =
     req.headers['x-file-path'] !== undefined
@@ -287,8 +429,8 @@ async function handleUpload(req, res, url) {
   if (!clientPath) throw new HttpError(400, 'Invalid file path.');
 
   const rawMtime = req.headers['x-client-mtime'] ?? url.searchParams.get('mtime') ?? Date.now();
-  const clientMtime = Math.floor(Number(rawMtime));
   const expectedHash = String(req.headers['x-cipher-hash'] ?? url.searchParams.get('hash') ?? '').toLowerCase();
+  const { keyId, ver } = parseKeyHeaders(req);
 
   const target = path.join(FILES_DIR, ...clientPath.split('/'));
   const tmp = path.join(DATA_DIR, `upload-${process.pid}-${crypto.randomBytes(6).toString('hex')}.tmp`);
@@ -300,13 +442,13 @@ async function handleUpload(req, res, url) {
   }
 
   const entry = {
-    mtime:
-      Number.isFinite(clientMtime) && clientMtime > 0
-        ? Math.min(clientMtime, Date.now() + MAX_MTIME_SKEW_MS)
-        : Date.now(),
+    mtime: clampClientMtime(rawMtime),
     size,
     hash,
     deleted: false, // uploading clears any tombstone
+    keyId,
+    ver,
+    manifest: '',
   };
   await withPathLock(clientPath, async () => {
     await fsp.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
@@ -315,6 +457,164 @@ async function handleUpload(req, res, url) {
     persistIndex();
   });
   sendJson(res, 200, { path: clientPath, ...entry });
+}
+
+// ------------------------------------------------- chunked transport (v3) --
+
+async function handleUploadBegin(req, res) {
+  const body = await readJsonBody(req);
+  if (!body || typeof body !== 'object') throw new HttpError(400, 'Body must be a JSON object.');
+  const clientPath = sanitizePath(body.path);
+  if (!clientPath) throw new HttpError(400, 'Invalid file path.');
+  const totalBytes = Number(body.totalBytes);
+  const chunkCount = Number(body.chunkCount);
+  const fileManifest = String(body.fileManifest ?? '');
+  if (!Number.isFinite(totalBytes) || totalBytes < 1 || totalBytes > MAX_FILE_BYTES) {
+    throw new HttpError(400, `totalBytes must be 1..${MAX_FILE_BYTES}.`);
+  }
+  if (!Number.isInteger(chunkCount) || chunkCount < 1 || chunkCount > 100_000) {
+    throw new HttpError(400, 'chunkCount must be an integer in 1..100000.');
+  }
+  if (!/^[0-9a-f]{64}$/.test(fileManifest)) {
+    throw new HttpError(400, 'fileManifest must be 64 hex characters.');
+  }
+
+  const uploadId = crypto.randomBytes(16).toString('hex');
+  const dir = stagingDir(uploadId);
+  await fsp.mkdir(dir, { mode: 0o700, recursive: true });
+  const record = {
+    path: clientPath,
+    totalBytes: Math.floor(totalBytes),
+    chunkCount,
+    fileManifest,
+    createdAt: Date.now(),
+  };
+  await writeJsonAtomic(path.join(dir, 'meta.json'), record);
+  staging.set(uploadId, record);
+  sendJson(res, 200, { uploadId });
+}
+
+async function handleUploadChunk(req, res, url) {
+  const uploadId = url.searchParams.get('uploadId') ?? '';
+  const dir = stagingDir(uploadId);
+  const record = staging.get(uploadId);
+  if (!record) throw new HttpError(404, 'Unknown or expired uploadId.');
+  const n = Number(url.searchParams.get('n'));
+  if (!Number.isInteger(n) || n < 0 || n >= record.chunkCount) {
+    throw new HttpError(400, `n must be an integer in 0..${record.chunkCount - 1}.`);
+  }
+  const expectedHash = String(req.headers['x-chunk-hash'] ?? '').toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(expectedHash)) {
+    throw new HttpError(400, 'X-Chunk-Hash must be 64 hex characters.');
+  }
+
+  const tmp = path.join(dir, `${n}.${crypto.randomBytes(4).toString('hex')}.tmp`);
+  const { hash } = await streamBodyToFile(req, tmp, MAX_BODY_BYTES);
+  if (hash !== expectedHash) {
+    await fsp.unlink(tmp).catch(() => {});
+    throw new HttpError(400, 'Chunk hash mismatch — upload corrupted in transit?');
+  }
+  await fsp.rename(tmp, path.join(dir, `${n}.part`)); // idempotent re-PUT
+
+  sendJson(res, 200, { accepted: acceptedChunksSync(dir, record.chunkCount) });
+}
+
+/** Synchronous listing of part files present on disk (source of truth). */
+function acceptedChunksSync(dir, chunkCount) {
+  let names;
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return [];
+  }
+  const accepted = [];
+  for (const name of names) {
+    const m = /^(\d+)\.part$/.exec(name);
+    if (m) {
+      const n = Number(m[1]);
+      if (n >= 0 && n < chunkCount) accepted.push(n);
+    }
+  }
+  return accepted.sort((a, b) => a - b);
+}
+
+async function handleUploadStatus(req, res, url) {
+  const uploadId = url.searchParams.get('uploadId') ?? '';
+  const dir = stagingDir(uploadId);
+  const record = staging.get(uploadId);
+  if (!record) throw new HttpError(404, 'Unknown or expired uploadId.');
+  sendJson(res, 200, { accepted: acceptedChunksSync(dir, record.chunkCount), chunkCount: record.chunkCount });
+}
+
+async function handleUploadCommit(req, res, url) {
+  const uploadId = url.searchParams.get('uploadId') ?? '';
+  const dir = stagingDir(uploadId);
+  const record = staging.get(uploadId);
+  if (!record) throw new HttpError(404, 'Unknown or expired uploadId.');
+
+  const accepted = acceptedChunksSync(dir, record.chunkCount);
+  if (accepted.length !== record.chunkCount) {
+    const missing = [];
+    for (let i = 0; i < record.chunkCount; i++) {
+      if (!accepted.includes(i)) missing.push(i);
+    }
+    throw new HttpError(400, `Upload incomplete — missing chunk(s): ${missing.slice(0, 8).join(', ')}${missing.length > 8 ? '…' : ''}.`);
+  }
+
+  const rawMtime = req.headers['x-client-mtime'] ?? Date.now();
+  const { keyId, ver } = parseKeyHeaders(req);
+  const target = path.join(FILES_DIR, ...record.path.split('/'));
+  const tmp = path.join(DATA_DIR, `commit-${process.pid}-${crypto.randomBytes(6).toString('hex')}.tmp`);
+
+  let totalSize = 0;
+  let blobHash = '';
+  await withPathLock(record.path, async () => {
+    // Concatenate parts into one blob under the path lock, hashing on the way.
+    const hasher = crypto.createHash('sha256');
+    const out = fs.createWriteStream(tmp, { mode: 0o600 });
+    try {
+      for (let i = 0; i < record.chunkCount; i++) {
+        await new Promise((resolve, reject) => {
+          const rs = fs.createReadStream(path.join(dir, `${i}.part`));
+          rs.on('data', (c) => hasher.update(c));
+          rs.on('error', reject);
+          rs.on('end', resolve);
+          rs.pipe(out, { end: false });
+        });
+      }
+      await new Promise((resolve, reject) => {
+        out.on('error', reject);
+        out.end(resolve);
+      });
+    } catch (err) {
+      out.destroy();
+      await fsp.unlink(tmp).catch(() => {});
+      throw err;
+    }
+    totalSize = await (await fsp.stat(tmp)).size;
+    blobHash = hasher.digest('hex');
+    if (totalSize > record.totalBytes || totalSize > MAX_FILE_BYTES) {
+      await fsp.unlink(tmp).catch(() => {});
+      throw new HttpError(400, 'Assembled blob exceeds the declared or configured size cap.');
+    }
+    await fsp.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
+    await fsp.rename(tmp, target); // atomic publish
+    index.set(record.path, {
+      mtime: clampClientMtime(rawMtime),
+      size: totalSize,
+      hash: blobHash,
+      deleted: false,
+      keyId,
+      ver,
+      manifest: record.fileManifest,
+    });
+    persistIndex();
+  });
+
+  await fsp.rm(dir, { recursive: true, force: true });
+  staging.delete(uploadId);
+  const entry = index.get(record.path);
+  sendJson(res, 200, { path: record.path, ...entry });
 }
 
 async function handleDownload(req, res, url) {
@@ -360,8 +660,9 @@ async function handleDelete(req, res, url) {
   if (!entry.deleted) {
     const target = path.join(FILES_DIR, ...clientPath.split('/'));
     // Tombstone: keep the path in the index so every other device learns about
-    // the deletion; mtime becomes the deletion time.
-    const tombstone = { mtime: Date.now(), size: 0, hash: '', deleted: true };
+    // the deletion; mtime becomes the deletion time. Version counters and key
+    // ids reset — a re-upload after a deletion starts a fresh history.
+    const tombstone = { mtime: Date.now(), size: 0, hash: '', deleted: true, keyId: '', ver: 0, manifest: '' };
     await withPathLock(clientPath, async () => {
       try {
         await fsp.unlink(target);
@@ -379,8 +680,30 @@ async function handleDelete(req, res, url) {
   sendJson(res, 200, { path: clientPath, ...entry });
 }
 
-function gcTombstones() {
-  if (!(TOMBSTONE_TTL_DAYS > 0)) return;
+/**
+ * GET /api/index with entity-tag conditioning (PROB-6): the ETag is the
+ * SHA-256 of the response body, so an unchanged index costs the client one
+ * 304 instead of a full re-download and replan on every idle cycle.
+ */
+function handleIndex(req, res) {
+  const body = JSON.stringify({ files: Object.fromEntries(index) });
+  const etag = `"${crypto.createHash('sha256').update(body, 'utf8').digest('hex')}"`;
+  const inm = String(req.headers['if-none-match'] ?? '');
+  if (inm === etag || inm === '*' || inm.replace(/^W\//, '') === etag) {
+    res.writeHead(304, { ETag: etag, 'Cache-Control': 'no-store' });
+    res.end();
+    return;
+  }
+  res.writeHead(200, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': Buffer.byteLength(body),
+    ETag: etag,
+    'Cache-Control': 'no-store',
+  });
+  res.end(body);
+}
+
+function gcTombstones() {  if (!(TOMBSTONE_TTL_DAYS > 0)) return;
   const cutoff = Date.now() - TOMBSTONE_TTL_DAYS * 86400_000;
   let removed = 0;
   for (const [filePath, entry] of index) {
@@ -418,9 +741,17 @@ const server = http.createServer((req, res) => {
       case 'GET /api/meta':
         return sendJson(res, 200, { vaultId: meta.vaultId });
       case 'GET /api/index':
-        return sendJson(res, 200, { files: Object.fromEntries(index) });
+        return handleIndex(req, res);
       case 'POST /api/upload':
         return await handleUpload(req, res, url);
+      case 'POST /api/upload/begin':
+        return await handleUploadBegin(req, res);
+      case 'PUT /api/upload/chunk':
+        return await handleUploadChunk(req, res, url);
+      case 'GET /api/upload/status':
+        return await handleUploadStatus(req, res, url);
+      case 'POST /api/upload/commit':
+        return await handleUploadCommit(req, res, url);
       case 'GET /api/download':
         return await handleDownload(req, res, url);
       case 'DELETE /api/delete':
