@@ -252,6 +252,11 @@ export default class E2eeSyncPlugin extends Plugin {
         if (record) this.journal[path] = record;
         else delete this.journal[path];
       },
+      getConfigJournal: () => this.configJournal,
+      setConfigJournalEntry: (path, record) => {
+        if (record) this.configJournal[path] = record;
+        else delete this.configJournal[path];
+      },
       persist: () => this.saveData({ settings: this.settings, journal: this.journal, configJournal: this.configJournal }),
       setStatus: (status, message) => this.updateStatus(status, message),
       notify: (message, timeout) => new Notice(message, timeout ?? 6000),

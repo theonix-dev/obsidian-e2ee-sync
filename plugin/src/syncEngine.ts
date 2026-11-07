@@ -209,11 +209,19 @@ export interface SyncSummary {
 
 interface PlannedOp {
   action: SyncAction;
-  /** Canonical path — journal key, AAD input and preferred storage key. */
+  /**
+   * Canonical SERVER path — journal key and AAD input. Vault-namespace ops
+   * carry the vault-relative path here; config-namespace ops carry
+   * `config/<rest>` and the vault path in `localPath`.
+   */
   path: string;
   /** Raw index key for API calls when it differs from the canonical form
    *  (pre-NFC entries uploaded by 0.1.x clients). */
   remoteKey?: string;
+  /** IMP-6: true for ops of the config/ namespace (separate journal section). */
+  config?: boolean;
+  /** IMP-6: vault-relative path for config ops (path under .obsidian/). */
+  localPath?: string;
   local?: FileStatLike;
   remote?: RemoteFileInfo;
 }
@@ -263,6 +271,12 @@ export interface EngineContext {
    * and per chunk of large-file uploads. Omitted => no progress UI.
    */
   setProgress?(progress: ProgressLike): void;
+  /**
+   * IMP-6: separate journal section for the config/ server namespace. Both
+   * omitted => config sync is unavailable (the planner skips it).
+   */
+  getConfigJournal?(): Record<string, SyncRecord>;
+  setConfigJournalEntry?(path: string, record: SyncRecord | null): void;
 }
 
 // ------------------------------------------------------------ pure planner --
@@ -484,6 +498,99 @@ export class SyncEngine {
     );
   }
 
+  // ------------------------------------------------ config namespace (IMP-6)
+
+  private static readonly CONFIG_PREFIX = 'config/';
+
+  private configEnabled(): boolean {
+    return this.ctx.getSettings().configSync?.enabled === true;
+  }
+
+  /**
+   * A real vault folder named `config` at the root would collide with the
+   * config/ server namespace — config sync refuses to run alongside it.
+   */
+  private hasRealConfigFolder(): boolean {
+    const existing = this.ctx.app.vault.getAbstractFileByPath('config');
+    return existing !== null && !(existing instanceof TFile);
+  }
+
+  /** 'config/<rest>' -> '<configDir>/<rest>'; null for vault-namespace paths. */
+  private serverPathToLocal(serverPath: string): string | null {
+    if (!serverPath.startsWith(SyncEngine.CONFIG_PREFIX)) return null;
+    return `${this.configDir}/${serverPath.slice(SyncEngine.CONFIG_PREFIX.length)}`;
+  }
+
+  /** '<configDir>/<rest>' -> 'config/<rest>'; null outside the config folder. */
+  private localPathToServer(localPath: string): string | null {
+    const prefix = `${this.configDir}/`;
+    if (!localPath.startsWith(prefix)) return null;
+    return `${SyncEngine.CONFIG_PREFIX}${localPath.slice(prefix.length)}`;
+  }
+
+  /** Journal record for a server path, whichever namespace owns it. */
+  private recordFor(serverPath: string): SyncRecord | undefined {
+    if (serverPath.startsWith(SyncEngine.CONFIG_PREFIX)) {
+      return this.ctx.getConfigJournal?.()[serverPath];
+    }
+    return this.ctx.getJournal()[serverPath];
+  }
+
+  /** Journal write for a server path, routed to the owning namespace. */
+  private putRecord(serverPath: string, record: SyncRecord | null): void {
+    if (serverPath.startsWith(SyncEngine.CONFIG_PREFIX)) {
+      this.ctx.setConfigJournalEntry?.(serverPath, record);
+      return;
+    }
+    this.ctx.setJournalEntry(serverPath, record);
+  }
+
+  /**
+   * Plan the hidden-configuration namespace: locals are the allowlisted files
+   * under .obsidian/ mapped to their config/ server paths; the remote subset
+   * is everything with the config/ prefix; the journal is the separate
+   * section. With `emptyLocals` (restore) every live entry plans a pull.
+   */
+  private planConfigSync(
+    remote: Map<string, RemoteEntry>,
+    emptyLocals = false,
+  ): PlannedOp[] {
+    if (!this.configEnabled() || !this.ctx.getConfigJournal || !this.ctx.setConfigJournalEntry) {
+      return [];
+    }
+    if (this.hasRealConfigFolder()) {
+      this.ctx.notify(
+        'E2EE Sync: hidden-configuration sync skipped — this vault has a real root-level "config" ' +
+          'folder whose paths would collide with the config/ namespace.',
+        12000,
+      );
+      return [];
+    }
+    const allow = this.ctx.getSettings().configSync;
+    const locals = new Map<string, FileStatLike>();
+    if (!emptyLocals) {
+      const prefix = `${this.configDir}/`;
+      for (const file of this.ctx.app.vault.getFiles()) {
+        if (!file.path.startsWith(prefix)) continue;
+        const rest = file.path.slice(prefix.length);
+        if (!isConfigSyncablePath(rest, allow)) continue;
+        const serverPath = `${SyncEngine.CONFIG_PREFIX}${rest}`;
+        if (!locals.has(serverPath)) locals.set(serverPath, { path: file.path, stat: file.stat });
+      }
+    }
+    const remoteConfig = new Map<string, RemoteEntry>();
+    for (const [key, entry] of remote) {
+      if (key.startsWith(SyncEngine.CONFIG_PREFIX)) remoteConfig.set(key, entry);
+    }
+    const cfgJournal = this.ctx.getConfigJournal();
+    const ops = planSync(locals, remoteConfig, cfgJournal, '', null);
+    return ops.map((op) => ({
+      ...op,
+      config: true,
+      localPath: op.local ? op.local.path : this.serverPathToLocal(op.path) ?? op.path,
+    }));
+  }
+
   /** Canonical paths we are writing ourselves; vault events for them are ignored. */
   private readonly ignorePaths = new Set<string>();
   /** Per-path debounce timers, keyed by canonical path. */
@@ -546,9 +653,19 @@ export class SyncEngine {
     if (newSyncable) this.onLocalTouched(newPath);
   }
 
+  /** IMP-6: allowed files under the config folder also feed the sync cycle. */
+  private isConfigWatched(rawPath: string): boolean {
+    if (!this.configEnabled()) return false;
+    const prefix = `${this.configDir}/`;
+    if (!rawPath.startsWith(prefix)) return false;
+    return isConfigSyncablePath(rawPath.slice(prefix.length), this.ctx.getSettings().configSync);
+  }
+
   private onLocalTouched(rawPath: string): void {
     const path = canonicalPath(rawPath);
-    if (!isSyncablePath(path, this.configDir, this.ignoreMatcherSync()) || this.ignorePaths.has(path)) return;
+    if (!isSyncablePath(path, this.configDir, this.ignoreMatcherSync()) || this.ignorePaths.has(path)) {
+      if (!this.isConfigWatched(path)) return;
+    }
     const existing = this.debounces.get(path);
     if (existing !== undefined) window.clearTimeout(existing);
 
@@ -609,7 +726,14 @@ export class SyncEngine {
       this.lastIndexEtag = indexResult.etag;
       this.ctx.setStatus('syncing');
 
-      const remote = this.canonicalizeRemote(indexResult.index.files ?? {});
+      const remoteAll = this.canonicalizeRemote(indexResult.index.files ?? {});
+      // IMP-6: config/* entries belong to the hidden-configuration namespace
+      // and never take part in the vault plan — otherwise they would surface
+      // as junk files in a root "config" folder on every device.
+      const remote = new Map<string, RemoteEntry>();
+      for (const [key, entry] of remoteAll) {
+        if (!key.startsWith(SyncEngine.CONFIG_PREFIX)) remote.set(key, entry);
+      }
       const ignores = await this.currentIgnoreMatcher();
       const locals = this.collectLocalFiles(ignores);
       const journal = this.ctx.getJournal();
@@ -623,6 +747,9 @@ export class SyncEngine {
       }
 
       const plan: PlannedOp[] = planSync(locals, remote, journal, this.configDir, ignores);
+      // IMP-6: hidden-configuration namespace rides the same plan and the
+      // same executor — the mass-deletion guard below sees both namespaces.
+      plan.push(...this.planConfigSync(remoteAll));
 
       // IMP-5 bookkeeping: flag records of newly-ignored paths ("ignored",
       // left untouched on the server) and clear the flag when a path becomes
@@ -802,12 +929,17 @@ export class SyncEngine {
     let done = 0;
     const total = plan.length;
     const runOp = async (op: PlannedOp): Promise<void> => {
-      this.progressState = { done, total, phase: SyncEngine.progressPhase(op.action), path: op.path };
+      this.progressState = {
+        done,
+        total,
+        phase: SyncEngine.progressPhase(op.action),
+        path: op.localPath ?? op.path, // config ops display their vault path
+      };
       this.emitProgress();
       try {
         switch (op.action) {
           case 'forget':
-            this.ctx.setJournalEntry(op.path, null);
+            this.putRecord(op.path, null);
             this.markJournalDirty();
             break;
           case 'push':
@@ -869,7 +1001,9 @@ export class SyncEngine {
   /** Read, encrypt and upload one vault file; then update its journal entry. */
   private async doPush(op: PlannedOp, setup: SyncSetup, summary: SyncSummary): Promise<void> {
     // Look the file up under its on-disk name; the op.path is canonical.
-    const file = this.ctx.app.vault.getAbstractFileByPath(op.local ? op.local.path : op.path);
+    const file = this.ctx.app.vault.getAbstractFileByPath(
+      op.localPath ?? (op.local ? op.local.path : op.path),
+    );
     if (!(file instanceof TFile)) return; // deleted mid-sync; next cycle tombstones it
 
     if (file.stat.size > MAX_FILE_BYTES) {
@@ -880,7 +1014,7 @@ export class SyncEngine {
     }
 
     const plaintext = await this.ctx.app.vault.readBinary(file);
-    const record = this.ctx.getJournal()[op.path];
+    const record = this.recordFor(op.path);
     const version = (record?.remoteVersion ?? 0) + 1;
     const uploaded = await this.encryptAndUpload(
       setup, op.path, plaintext, file.stat.mtime, version,
@@ -895,7 +1029,7 @@ export class SyncEngine {
     // After a successful push local == remote, so the pushed content is the
     // next merge base (IMP-1; only stored when the toggle is on).
     this.setMergeBase(op.path, journalEntry, plaintext);
-    this.ctx.setJournalEntry(op.path, journalEntry);
+    this.putRecord(op.path, journalEntry);
     this.markJournalDirty();
     summary.pushed++;
   }
@@ -1005,7 +1139,7 @@ export class SyncEngine {
     } catch (error) {
       if (error instanceof ApiError && error.status === 404) {
         // Deleted on another device between index and download — accept it.
-        this.ctx.setJournalEntry(op.path, null);
+        this.putRecord(op.path, null);
         this.markJournalDirty();
         return;
       }
@@ -1023,7 +1157,7 @@ export class SyncEngine {
       );
     }
 
-    const record = this.ctx.getJournal()[op.path];
+    const record = this.recordFor(op.path);
     const manifest = remote.manifest && remote.manifest.length === 64 ? remote.manifest : null;
 
     // Cheap pre-decrypt rollback check from the (untrusted) index counters —
@@ -1067,44 +1201,49 @@ export class SyncEngine {
     if (refusal) throw new Error(`${refusal} (${op.path})`);
 
     // PROB-4: on case-insensitive filesystems a pull must never overwrite a
-    // different local file that differs only by ASCII case.
-    const caseVariant = findCaseVariant(op.path, this.planLocals?.keys() ?? []);
-    const targetPath = caseVariant
-      ? this.uniqueConflictPath(op.path, '_remote-case_')
-      : op.path;
+    // different local file that differs only by ASCII case. Config-namespace
+    // pulls write under their vault path (op.localPath).
+    const localTarget = op.localPath ?? op.path;
+    const caseVariant = findCaseVariant(localTarget, this.planLocals?.keys() ?? []);
+    const targetLocal = caseVariant
+      ? this.uniqueConflictPath(localTarget, '_remote-case_')
+      : localTarget;
+    const targetPath = op.config
+      ? this.localPathToServer(targetLocal) ?? op.path // journal/AAD key stays in config/
+      : targetLocal;
     if (caseVariant) {
       this.ctx.notify(
-        `Case collision: "${op.path}" and "${caseVariant}" differ only by letter case — ` +
-          `the downloaded copy was saved as "${targetPath}".`,
+        `Case collision: "${localTarget}" and "${caseVariant}" differ only by letter case — ` +
+          `the downloaded copy was saved as "${targetLocal}".`,
         12000,
       );
     }
 
     // Match the local counterpart under its on-disk name when we know it.
     const existing = this.ctx.app.vault.getAbstractFileByPath(
-      !caseVariant && op.local ? op.local.path : targetPath,
+      !caseVariant && op.local ? op.local.path : targetLocal,
     );
     if (existing && !(existing instanceof TFile)) {
-      throw new Error(`Local path exists but is a folder: ${targetPath}`);
+      throw new Error(`Local path exists but is a folder: ${targetLocal}`);
     }
 
-    this.beginIgnore(targetPath); // our own write must not re-trigger sync
+    this.beginIgnore(targetLocal); // our own write must not re-trigger sync
     try {
       if (existing) {
         await this.ctx.app.vault.modifyBinary(existing, plaintext);
       } else {
-        await this.ensureParentFolder(targetPath);
-        await this.ctx.app.vault.createBinary(targetPath, plaintext);
+        await this.ensureParentFolder(targetLocal);
+        await this.ctx.app.vault.createBinary(targetLocal, plaintext);
       }
     } catch (error) {
-      this.ignorePaths.delete(targetPath);
+      this.ignorePaths.delete(targetLocal);
       throw error;
     }
 
     // The write bumps the local mtime to "now" — the journal must record that
     // exact value, otherwise the next cycle would mistake our own pull for a
     // local modification and push it right back.
-    const written = this.ctx.app.vault.getAbstractFileByPath(targetPath);
+    const written = this.ctx.app.vault.getAbstractFileByPath(targetLocal);
     const journalEntry: SyncRecord = {
       localMtime: written instanceof TFile ? written.stat.mtime : Date.now(),
       remoteHash: remote.hash,
@@ -1113,8 +1252,8 @@ export class SyncEngine {
     };
     // The pulled copy is the next merge base (IMP-1).
     this.setMergeBase(targetPath, journalEntry, plaintext);
-    this.ctx.setJournalEntry(targetPath, journalEntry);
-    if (caseVariant) this.ctx.setJournalEntry(op.path, null);
+    this.putRecord(targetPath, journalEntry);
+    if (caseVariant) this.putRecord(op.path, null);
     this.markJournalDirty();
     summary.pulled++;
   }
@@ -1187,18 +1326,19 @@ export class SyncEngine {
     // 1. Write the merged note locally (our own write must not re-trigger sync).
     const mergedBytes = new TextEncoder().encode(result.text);
     const mergedBuffer = mergedBytes.buffer as ArrayBuffer;
-    this.beginIgnore(op.path);
+    const localPath = op.localPath ?? op.local.path;
+    this.beginIgnore(localPath);
     try {
       await this.ctx.app.vault.modifyBinary(local, mergedBuffer);
     } catch (error) {
-      this.ignorePaths.delete(op.path);
+      this.ignorePaths.delete(localPath);
       throw error;
     }
 
     // 2. Push the merged content to the original path. A failure here leaves
     //    the merged local file unjournaled — the next cycle plans a push and
     //    converges (no data can be lost: theirs is untouched on the server).
-    const written = this.ctx.app.vault.getAbstractFileByPath(op.path);
+    const written = this.ctx.app.vault.getAbstractFileByPath(localPath);
     const mtime = written instanceof TFile ? written.stat.mtime : local.stat.mtime;
     const version = Math.max(record.remoteVersion ?? 0, remote.ver ?? 0) + 1;
     const uploaded = await this.encryptAndUpload(setup, op.path, mergedBuffer, mtime, version);
@@ -1209,7 +1349,7 @@ export class SyncEngine {
       remoteVersion: version,
     };
     this.setMergeBase(op.path, journalEntry, mergedBuffer);
-    this.ctx.setJournalEntry(op.path, journalEntry);
+    this.putRecord(op.path, journalEntry);
     this.markJournalDirty();
 
     summary.merged++;
@@ -1245,7 +1385,9 @@ export class SyncEngine {
     summary: SyncSummary,
     record: SyncRecord | undefined,
   ): Promise<void> {
-    const local = this.ctx.app.vault.getAbstractFileByPath(op.local ? op.local.path : op.path);
+    const local = this.ctx.app.vault.getAbstractFileByPath(
+      op.localPath ?? (op.local ? op.local.path : op.path),
+    );
     if (!(local instanceof TFile)) return;
     const plaintext = await this.ctx.app.vault.readBinary(local);
     const version = Math.max(record?.remoteVersion ?? 0, op.remote?.ver ?? 0) + 1;
@@ -1259,7 +1401,7 @@ export class SyncEngine {
       remoteVersion: version,
     };
     this.setMergeBase(op.path, entry, plaintext);
-    this.ctx.setJournalEntry(op.path, entry);
+    this.putRecord(op.path, entry);
     this.markJournalDirty();
     summary.pushed++;
     this.ctx.notify(`Conflict in ${op.path} resolved: your version was kept.`, 6000);
@@ -1280,7 +1422,7 @@ export class SyncEngine {
     const local = this.ctx.app.vault.getAbstractFileByPath(op.local.path);
     if (!(local instanceof TFile)) return; // vanished mid-sync; next cycle retries
 
-    const record = this.ctx.getJournal()[op.path];
+    const record = this.recordFor(op.path);
     if (this.mergeBaseEnabled()) {
       const merged = await this.tryMarkdownMerge(op, setup, summary, record);
       if (merged) return;
@@ -1305,7 +1447,12 @@ export class SyncEngine {
       return;
     }
 
-    const conflictPath = this.uniqueConflictPath(op.path);
+    // Conflict copies live next to the original (vault path); their server
+    // key follows the namespace (config ops -> config/<copy name>).
+    const conflictLocal = this.uniqueConflictPath(op.localPath ?? op.path);
+    const conflictPath = op.config
+      ? this.localPathToServer(conflictLocal) ?? conflictLocal
+      : conflictLocal;
     const localCopy = await this.ctx.app.vault.readBinary(local);
     const version = (record?.remoteVersion ?? 0) + 1;
 
@@ -1316,14 +1463,14 @@ export class SyncEngine {
     );
 
     // 2. Materialize the copy locally and journal it.
-    this.beginIgnore(conflictPath);
+    this.beginIgnore(conflictLocal);
     try {
-      await this.ctx.app.vault.createBinary(conflictPath, localCopy);
+      await this.ctx.app.vault.createBinary(conflictLocal, localCopy);
     } catch (error) {
-      this.ignorePaths.delete(conflictPath);
+      this.ignorePaths.delete(conflictLocal);
       throw error;
     }
-    const written = this.ctx.app.vault.getAbstractFileByPath(conflictPath);
+    const written = this.ctx.app.vault.getAbstractFileByPath(conflictLocal);
     const conflictEntry: SyncRecord = {
       localMtime: written instanceof TFile ? written.stat.mtime : local.stat.mtime,
       remoteHash: uploaded.hash,
@@ -1332,7 +1479,7 @@ export class SyncEngine {
     };
     // A fresh conflict copy has no common ancestor yet — no merge base.
     this.setMergeBase(conflictPath, conflictEntry, null);
-    this.ctx.setJournalEntry(conflictPath, conflictEntry);
+    this.putRecord(conflictPath, conflictEntry);
     this.markJournalDirty();
 
     // 3. Remote wins the original path.
@@ -1340,7 +1487,7 @@ export class SyncEngine {
 
     summary.conflicts++;
     this.ctx.notify(
-      `Conflict detected in file: ${op.path}\nBoth versions kept — local copy saved as: ${conflictPath}`,
+      `Conflict detected in file: ${op.localPath ?? op.path}\nBoth versions kept — local copy saved as: ${conflictLocal}`,
       10000,
     );
   }
@@ -1351,42 +1498,44 @@ export class SyncEngine {
     summary: SyncSummary,
   ): Promise<void> {
     const file = op.local instanceof TFile ? op.local : null;
-    const target = file ?? this.ctx.app.vault.getAbstractFileByPath(op.path);
+    const target = file ?? this.ctx.app.vault.getAbstractFileByPath(op.localPath ?? op.path);
     if (!(target instanceof TFile)) return;
-    const renamed = this.uniqueConflictPath(op.path, '_case-collision_');
-    this.beginIgnore(op.path);
+    const localPath = op.localPath ?? op.path;
+    const renamed = this.uniqueConflictPath(localPath, '_case-collision_');
+    this.beginIgnore(localPath);
     this.beginIgnore(renamed);
     try {
       await this.ctx.app.vault.rename(target, renamed);
     } catch (error) {
-      this.ignorePaths.delete(op.path);
+      this.ignorePaths.delete(localPath);
       this.ignorePaths.delete(renamed);
       throw error;
     }
     // The renamed file is untracked; the old key is forgotten so a possible
     // remote entry under it resolves through the normal rules next cycle.
-    this.ctx.setJournalEntry(op.path, null);
+    this.putRecord(op.path, null);
     this.markJournalDirty();
     summary.conflicts++;
     this.ctx.notify(
-      `Case collision: "${op.path}" and another file differ only by letter case — ` +
+      `Case collision: "${localPath}" and another file differ only by letter case — ` +
         `renamed to "${renamed}" so both are kept.`,
       12000,
     );
   }
 
   private async doDeleteLocal(op: PlannedOp, summary: SyncSummary): Promise<void> {
-    const file = this.ctx.app.vault.getAbstractFileByPath(op.local ? op.local.path : op.path);
+    const localPath = op.localPath ?? (op.local ? op.local.path : op.path);
+    const file = this.ctx.app.vault.getAbstractFileByPath(localPath);
     if (file instanceof TFile) {
-      this.beginIgnore(op.path);
+      this.beginIgnore(localPath);
       try {
         await this.ctx.app.vault.trash(file, true); // system trash; .trash is excluded from sync
       } catch (error) {
-        this.ignorePaths.delete(op.path);
+        this.ignorePaths.delete(localPath);
         throw error;
       }
     }
-    this.ctx.setJournalEntry(op.path, null);
+    this.putRecord(op.path, null);
     this.markJournalDirty();
     summary.deletedLocal++;
   }
@@ -1401,7 +1550,7 @@ export class SyncEngine {
         throw error;
       }
     }
-    this.ctx.setJournalEntry(op.path, null);
+    this.putRecord(op.path, null);
     this.markJournalDirty();
     summary.deletedRemote++;
   }
@@ -1451,11 +1600,22 @@ export class SyncEngine {
       for (const path of Object.keys(this.ctx.getJournal())) {
         this.ctx.setJournalEntry(path, null);
       }
+      // IMP-6: the config namespace re-baselines together with the vault.
+      const cfgJournal = this.ctx.getConfigJournal?.();
+      if (cfgJournal) {
+        for (const path of Object.keys(cfgJournal)) this.ctx.setConfigJournalEntry?.(path, null);
+      }
       this.lastIndexEtag = '';
 
-      const remote = this.canonicalizeRemote(index.files ?? {});
+      const remoteAll = this.canonicalizeRemote(index.files ?? {});
+      const remote = new Map<string, RemoteEntry>();
+      for (const [key, entry] of remoteAll) {
+        if (!key.startsWith(SyncEngine.CONFIG_PREFIX)) remote.set(key, entry);
+      }
       const ignores = await this.currentIgnoreMatcher();
       const plan: PlannedOp[] = planSync(new Map(), remote, {}, this.configDir, ignores);
+      // Every live config/ entry plans a pull (locals treated as empty).
+      plan.push(...this.planConfigSync(remoteAll, true));
       // planLocals feeds the write-time case-collision guard in doPull.
       this.planLocals = this.collectLocalFiles(ignores);
       this.ctx.setStatus('syncing', `restoring ${liveCount} file(s)…`);
@@ -1551,13 +1711,14 @@ export class SyncEngine {
     const skipped: string[] = [];
     await this.runPool(paths, 2, async (path) => {
       try {
-        const file = this.ctx.app.vault.getAbstractFileByPath(path);
+        const localPath = this.serverPathToLocal(path) ?? path;
+        const file = this.ctx.app.vault.getAbstractFileByPath(localPath);
         if (!(file instanceof TFile)) {
           skipped.push(path);
           return;
         }
         const plaintext = await this.ctx.app.vault.readBinary(file);
-        const record = this.ctx.getJournal()[path];
+        const record = this.recordFor(path);
         const version = (record?.remoteVersion ?? 0) + 1;
         const uploaded = await this.encryptAndUpload(setup, path, plaintext, file.stat.mtime, version);
         const repairEntry: SyncRecord = {
@@ -1567,7 +1728,7 @@ export class SyncEngine {
           remoteVersion: version,
         };
         this.setMergeBase(path, repairEntry, plaintext);
-        this.ctx.setJournalEntry(path, repairEntry);
+        this.putRecord(path, repairEntry);
         this.markJournalDirty();
         repaired.push(path);
       } catch {
@@ -1674,7 +1835,7 @@ export class SyncEngine {
         } else {
           plaintext = (await oldManager.decrypt(blob, path)).plaintext;
         }
-        const record = this.ctx.getJournal()[path];
+        const record = this.recordFor(path);
         const version = Math.max(record?.remoteVersion ?? 0, entry.ver ?? 0) + 1;
         const uploaded = await this.encryptAndUpload(newSetup, path, plaintext, Date.now(), version);
         const rotationEntry: SyncRecord = {
@@ -1684,7 +1845,7 @@ export class SyncEngine {
           remoteVersion: version,
         };
         this.setMergeBase(path, rotationEntry, plaintext);
-        this.ctx.setJournalEntry(path, rotationEntry);
+        this.putRecord(path, rotationEntry);
         this.markJournalDirty();
         done++;
         if (done % 10 === 0 || done === remoteFiles.length) {

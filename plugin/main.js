@@ -1092,6 +1092,31 @@ function isSyncablePath(p, configDir, ignores) {
   if (ignores == null ? void 0 : ignores.isIgnored(p)) return false;
   return true;
 }
+function isConfigSyncablePath(rest, allow) {
+  if (!allow.enabled) return false;
+  const segs = rest.split("/").filter((s) => s !== "");
+  if (segs.length === 0) return false;
+  const top = segs[0];
+  if (segs.length === 1) {
+    if (top === "workspace.json") return allow.workspace;
+    if (top === "appearance.json") return allow.appearance;
+    if (top === "app.json") return allow.app;
+    if (top === "hotkeys.json") return allow.hotkeys;
+    return false;
+  }
+  if (top === "snippets") return allow.snippets;
+  if (top === "themes") return allow.themes;
+  if (top === "plugins") {
+    if (segs.length !== 3) return false;
+    const file = segs[2];
+    if (file === "data.json") return allow.pluginData;
+    if (file === "main.js" || file === "manifest.json" || file === "styles.css") {
+      return allow.pluginCode;
+    }
+    return false;
+  }
+  return false;
+}
 var CONFLICT_PROMPT_LIMIT = 5;
 function planSync(locals, remote, journal, configDir, ignores) {
   var _a;
@@ -1179,7 +1204,7 @@ function rollbackReason(recordVersion, packetVersion) {
   }
   return null;
 }
-var SyncEngine = class _SyncEngine {
+var _SyncEngine = class _SyncEngine {
   constructor(ctx) {
     this.ctx = ctx;
     this.api = null;
@@ -1245,6 +1270,90 @@ var SyncEngine = class _SyncEngine {
     var _a, _b;
     return (_b = (_a = this.ignoreCache) == null ? void 0 : _a.matcher) != null ? _b : ignoreMatcherFromSources(this.ctx.getSettings().ignorePatterns);
   }
+  configEnabled() {
+    var _a;
+    return ((_a = this.ctx.getSettings().configSync) == null ? void 0 : _a.enabled) === true;
+  }
+  /**
+   * A real vault folder named `config` at the root would collide with the
+   * config/ server namespace — config sync refuses to run alongside it.
+   */
+  hasRealConfigFolder() {
+    const existing = this.ctx.app.vault.getAbstractFileByPath("config");
+    return existing !== null && !(existing instanceof import_obsidian2.TFile);
+  }
+  /** 'config/<rest>' -> '<configDir>/<rest>'; null for vault-namespace paths. */
+  serverPathToLocal(serverPath) {
+    if (!serverPath.startsWith(_SyncEngine.CONFIG_PREFIX)) return null;
+    return `${this.configDir}/${serverPath.slice(_SyncEngine.CONFIG_PREFIX.length)}`;
+  }
+  /** '<configDir>/<rest>' -> 'config/<rest>'; null outside the config folder. */
+  localPathToServer(localPath) {
+    const prefix = `${this.configDir}/`;
+    if (!localPath.startsWith(prefix)) return null;
+    return `${_SyncEngine.CONFIG_PREFIX}${localPath.slice(prefix.length)}`;
+  }
+  /** Journal record for a server path, whichever namespace owns it. */
+  recordFor(serverPath) {
+    var _a, _b;
+    if (serverPath.startsWith(_SyncEngine.CONFIG_PREFIX)) {
+      return (_b = (_a = this.ctx).getConfigJournal) == null ? void 0 : _b.call(_a)[serverPath];
+    }
+    return this.ctx.getJournal()[serverPath];
+  }
+  /** Journal write for a server path, routed to the owning namespace. */
+  putRecord(serverPath, record) {
+    var _a, _b;
+    if (serverPath.startsWith(_SyncEngine.CONFIG_PREFIX)) {
+      (_b = (_a = this.ctx).setConfigJournalEntry) == null ? void 0 : _b.call(_a, serverPath, record);
+      return;
+    }
+    this.ctx.setJournalEntry(serverPath, record);
+  }
+  /**
+   * Plan the hidden-configuration namespace: locals are the allowlisted files
+   * under .obsidian/ mapped to their config/ server paths; the remote subset
+   * is everything with the config/ prefix; the journal is the separate
+   * section. With `emptyLocals` (restore) every live entry plans a pull.
+   */
+  planConfigSync(remote, emptyLocals = false) {
+    if (!this.configEnabled() || !this.ctx.getConfigJournal || !this.ctx.setConfigJournalEntry) {
+      return [];
+    }
+    if (this.hasRealConfigFolder()) {
+      this.ctx.notify(
+        'E2EE Sync: hidden-configuration sync skipped \u2014 this vault has a real root-level "config" folder whose paths would collide with the config/ namespace.',
+        12e3
+      );
+      return [];
+    }
+    const allow = this.ctx.getSettings().configSync;
+    const locals = /* @__PURE__ */ new Map();
+    if (!emptyLocals) {
+      const prefix = `${this.configDir}/`;
+      for (const file of this.ctx.app.vault.getFiles()) {
+        if (!file.path.startsWith(prefix)) continue;
+        const rest = file.path.slice(prefix.length);
+        if (!isConfigSyncablePath(rest, allow)) continue;
+        const serverPath = `${_SyncEngine.CONFIG_PREFIX}${rest}`;
+        if (!locals.has(serverPath)) locals.set(serverPath, { path: file.path, stat: file.stat });
+      }
+    }
+    const remoteConfig = /* @__PURE__ */ new Map();
+    for (const [key, entry] of remote) {
+      if (key.startsWith(_SyncEngine.CONFIG_PREFIX)) remoteConfig.set(key, entry);
+    }
+    const cfgJournal = this.ctx.getConfigJournal();
+    const ops = planSync(locals, remoteConfig, cfgJournal, "", null);
+    return ops.map((op) => {
+      var _a;
+      return {
+        ...op,
+        config: true,
+        localPath: op.local ? op.local.path : (_a = this.serverPathToLocal(op.path)) != null ? _a : op.path
+      };
+    });
+  }
   dispose() {
     for (const t of this.debounces.values()) window.clearTimeout(t);
     this.debounces.clear();
@@ -1281,9 +1390,18 @@ var SyncEngine = class _SyncEngine {
     if (oldSyncable) this.onLocalTouched(oldPath);
     if (newSyncable) this.onLocalTouched(newPath);
   }
+  /** IMP-6: allowed files under the config folder also feed the sync cycle. */
+  isConfigWatched(rawPath) {
+    if (!this.configEnabled()) return false;
+    const prefix = `${this.configDir}/`;
+    if (!rawPath.startsWith(prefix)) return false;
+    return isConfigSyncablePath(rawPath.slice(prefix.length), this.ctx.getSettings().configSync);
+  }
   onLocalTouched(rawPath) {
     const path = canonicalPath(rawPath);
-    if (!isSyncablePath(path, this.configDir, this.ignoreMatcherSync()) || this.ignorePaths.has(path)) return;
+    if (!isSyncablePath(path, this.configDir, this.ignoreMatcherSync()) || this.ignorePaths.has(path)) {
+      if (!this.isConfigWatched(path)) return;
+    }
     const existing = this.debounces.get(path);
     if (existing !== void 0) window.clearTimeout(existing);
     const timer = window.setTimeout(() => {
@@ -1339,7 +1457,11 @@ var SyncEngine = class _SyncEngine {
       const setup = await this.ensureSetup(api, password, indexResult.index);
       this.lastIndexEtag = indexResult.etag;
       this.ctx.setStatus("syncing");
-      const remote = this.canonicalizeRemote((_b = indexResult.index.files) != null ? _b : {});
+      const remoteAll = this.canonicalizeRemote((_b = indexResult.index.files) != null ? _b : {});
+      const remote = /* @__PURE__ */ new Map();
+      for (const [key, entry] of remoteAll) {
+        if (!key.startsWith(_SyncEngine.CONFIG_PREFIX)) remote.set(key, entry);
+      }
       const ignores = await this.currentIgnoreMatcher();
       const locals = this.collectLocalFiles(ignores);
       const journal = this.ctx.getJournal();
@@ -1349,6 +1471,7 @@ var SyncEngine = class _SyncEngine {
         }
       }
       const plan = planSync(locals, remote, journal, this.configDir, ignores);
+      plan.push(...this.planConfigSync(remoteAll));
       let ignoreFlagsChanged = false;
       for (const [path, rec] of Object.entries(journal)) {
         if (!rec) continue;
@@ -1506,12 +1629,19 @@ var SyncEngine = class _SyncEngine {
     let done = 0;
     const total = plan.length;
     const runOp = async (op) => {
-      this.progressState = { done, total, phase: _SyncEngine.progressPhase(op.action), path: op.path };
+      var _a;
+      this.progressState = {
+        done,
+        total,
+        phase: _SyncEngine.progressPhase(op.action),
+        path: (_a = op.localPath) != null ? _a : op.path
+        // config ops display their vault path
+      };
       this.emitProgress();
       try {
         switch (op.action) {
           case "forget":
-            this.ctx.setJournalEntry(op.path, null);
+            this.putRecord(op.path, null);
             this.markJournalDirty();
             break;
           case "push":
@@ -1567,8 +1697,10 @@ var SyncEngine = class _SyncEngine {
   }
   /** Read, encrypt and upload one vault file; then update its journal entry. */
   async doPush(op, setup, summary) {
-    var _a;
-    const file = this.ctx.app.vault.getAbstractFileByPath(op.local ? op.local.path : op.path);
+    var _a, _b;
+    const file = this.ctx.app.vault.getAbstractFileByPath(
+      (_a = op.localPath) != null ? _a : op.local ? op.local.path : op.path
+    );
     if (!(file instanceof import_obsidian2.TFile)) return;
     if (file.stat.size > MAX_FILE_BYTES) {
       throw new Error(
@@ -1576,8 +1708,8 @@ var SyncEngine = class _SyncEngine {
       );
     }
     const plaintext = await this.ctx.app.vault.readBinary(file);
-    const record = this.ctx.getJournal()[op.path];
-    const version = ((_a = record == null ? void 0 : record.remoteVersion) != null ? _a : 0) + 1;
+    const record = this.recordFor(op.path);
+    const version = ((_b = record == null ? void 0 : record.remoteVersion) != null ? _b : 0) + 1;
     const uploaded = await this.encryptAndUpload(
       setup,
       op.path,
@@ -1592,7 +1724,7 @@ var SyncEngine = class _SyncEngine {
       remoteVersion: version
     };
     this.setMergeBase(op.path, journalEntry, plaintext);
-    this.ctx.setJournalEntry(op.path, journalEntry);
+    this.putRecord(op.path, journalEntry);
     this.markJournalDirty();
     summary.pushed++;
   }
@@ -1673,7 +1805,7 @@ var SyncEngine = class _SyncEngine {
   }
   /** Download, decrypt and write one remote file; then update its journal. */
   async doPull(op, setup, summary) {
-    var _a, _b, _c, _d, _e, _f;
+    var _a, _b, _c, _d, _e, _f, _g, _h;
     const remote = op.remote;
     if (!remote) throw new Error("Pull planned without remote metadata.");
     let packet;
@@ -1681,7 +1813,7 @@ var SyncEngine = class _SyncEngine {
       packet = await setup.api.download((_a = op.remoteKey) != null ? _a : op.path);
     } catch (error) {
       if (error instanceof ApiError && error.status === 404) {
-        this.ctx.setJournalEntry(op.path, null);
+        this.putRecord(op.path, null);
         this.markJournalDirty();
         return;
       }
@@ -1693,7 +1825,7 @@ var SyncEngine = class _SyncEngine {
         `Integrity check failed: downloaded bytes do not match the server index (rollback or corruption) \u2014 refusing to overwrite ${op.path}.`
       );
     }
-    const record = this.ctx.getJournal()[op.path];
+    const record = this.recordFor(op.path);
     const manifest = remote.manifest && remote.manifest.length === 64 ? remote.manifest : null;
     if (record && ((_b = remote.ver) != null ? _b : 0) > 0 && ((_c = remote.ver) != null ? _c : 0) < record.remoteVersion) {
       throw new Error(
@@ -1726,33 +1858,35 @@ var SyncEngine = class _SyncEngine {
     }
     const refusal = record ? rollbackReason(record.remoteVersion, packetVersion) : null;
     if (refusal) throw new Error(`${refusal} (${op.path})`);
-    const caseVariant = findCaseVariant(op.path, (_f = (_e = this.planLocals) == null ? void 0 : _e.keys()) != null ? _f : []);
-    const targetPath = caseVariant ? this.uniqueConflictPath(op.path, "_remote-case_") : op.path;
+    const localTarget = (_e = op.localPath) != null ? _e : op.path;
+    const caseVariant = findCaseVariant(localTarget, (_g = (_f = this.planLocals) == null ? void 0 : _f.keys()) != null ? _g : []);
+    const targetLocal = caseVariant ? this.uniqueConflictPath(localTarget, "_remote-case_") : localTarget;
+    const targetPath = op.config ? (_h = this.localPathToServer(targetLocal)) != null ? _h : op.path : targetLocal;
     if (caseVariant) {
       this.ctx.notify(
-        `Case collision: "${op.path}" and "${caseVariant}" differ only by letter case \u2014 the downloaded copy was saved as "${targetPath}".`,
+        `Case collision: "${localTarget}" and "${caseVariant}" differ only by letter case \u2014 the downloaded copy was saved as "${targetLocal}".`,
         12e3
       );
     }
     const existing = this.ctx.app.vault.getAbstractFileByPath(
-      !caseVariant && op.local ? op.local.path : targetPath
+      !caseVariant && op.local ? op.local.path : targetLocal
     );
     if (existing && !(existing instanceof import_obsidian2.TFile)) {
-      throw new Error(`Local path exists but is a folder: ${targetPath}`);
+      throw new Error(`Local path exists but is a folder: ${targetLocal}`);
     }
-    this.beginIgnore(targetPath);
+    this.beginIgnore(targetLocal);
     try {
       if (existing) {
         await this.ctx.app.vault.modifyBinary(existing, plaintext);
       } else {
-        await this.ensureParentFolder(targetPath);
-        await this.ctx.app.vault.createBinary(targetPath, plaintext);
+        await this.ensureParentFolder(targetLocal);
+        await this.ctx.app.vault.createBinary(targetLocal, plaintext);
       }
     } catch (error) {
-      this.ignorePaths.delete(targetPath);
+      this.ignorePaths.delete(targetLocal);
       throw error;
     }
-    const written = this.ctx.app.vault.getAbstractFileByPath(targetPath);
+    const written = this.ctx.app.vault.getAbstractFileByPath(targetLocal);
     const journalEntry = {
       localMtime: written instanceof import_obsidian2.TFile ? written.stat.mtime : Date.now(),
       remoteHash: remote.hash,
@@ -1760,8 +1894,8 @@ var SyncEngine = class _SyncEngine {
       remoteVersion: packetVersion
     };
     this.setMergeBase(targetPath, journalEntry, plaintext);
-    this.ctx.setJournalEntry(targetPath, journalEntry);
-    if (caseVariant) this.ctx.setJournalEntry(op.path, null);
+    this.putRecord(targetPath, journalEntry);
+    if (caseVariant) this.putRecord(op.path, null);
     this.markJournalDirty();
     summary.pulled++;
   }
@@ -1795,7 +1929,7 @@ var SyncEngine = class _SyncEngine {
    * failures (network, crypto) propagate — the next cycle retries.
    */
   async tryMarkdownMerge(op, setup, summary, record) {
-    var _a, _b, _c;
+    var _a, _b, _c, _d;
     if (!op.local || !op.remote || !(record == null ? void 0 : record.basePlain)) return false;
     if (!this.isMergeCandidate(op.path, record.basePlain.length)) return false;
     const local = this.ctx.app.vault.getAbstractFileByPath(op.local.path);
@@ -1817,16 +1951,17 @@ var SyncEngine = class _SyncEngine {
     if (result.kind !== "merged") return false;
     const mergedBytes = new TextEncoder().encode(result.text);
     const mergedBuffer = mergedBytes.buffer;
-    this.beginIgnore(op.path);
+    const localPath = (_b = op.localPath) != null ? _b : op.local.path;
+    this.beginIgnore(localPath);
     try {
       await this.ctx.app.vault.modifyBinary(local, mergedBuffer);
     } catch (error) {
-      this.ignorePaths.delete(op.path);
+      this.ignorePaths.delete(localPath);
       throw error;
     }
-    const written = this.ctx.app.vault.getAbstractFileByPath(op.path);
+    const written = this.ctx.app.vault.getAbstractFileByPath(localPath);
     const mtime = written instanceof import_obsidian2.TFile ? written.stat.mtime : local.stat.mtime;
-    const version = Math.max((_b = record.remoteVersion) != null ? _b : 0, (_c = remote.ver) != null ? _c : 0) + 1;
+    const version = Math.max((_c = record.remoteVersion) != null ? _c : 0, (_d = remote.ver) != null ? _d : 0) + 1;
     const uploaded = await this.encryptAndUpload(setup, op.path, mergedBuffer, mtime, version);
     const journalEntry = {
       localMtime: mtime,
@@ -1835,7 +1970,7 @@ var SyncEngine = class _SyncEngine {
       remoteVersion: version
     };
     this.setMergeBase(op.path, journalEntry, mergedBuffer);
-    this.ctx.setJournalEntry(op.path, journalEntry);
+    this.putRecord(op.path, journalEntry);
     this.markJournalDirty();
     summary.merged++;
     this.ctx.notify(`Conflict in ${op.path} resolved by Markdown auto-merge.`, 6e3);
@@ -1863,11 +1998,13 @@ var SyncEngine = class _SyncEngine {
   }
   /** IMP-2 "keep mine": overwrite the remote original with the local version. */
   async pushLocalOverRemote(op, setup, summary, record) {
-    var _a, _b, _c;
-    const local = this.ctx.app.vault.getAbstractFileByPath(op.local ? op.local.path : op.path);
+    var _a, _b, _c, _d;
+    const local = this.ctx.app.vault.getAbstractFileByPath(
+      (_a = op.localPath) != null ? _a : op.local ? op.local.path : op.path
+    );
     if (!(local instanceof import_obsidian2.TFile)) return;
     const plaintext = await this.ctx.app.vault.readBinary(local);
-    const version = Math.max((_a = record == null ? void 0 : record.remoteVersion) != null ? _a : 0, (_c = (_b = op.remote) == null ? void 0 : _b.ver) != null ? _c : 0) + 1;
+    const version = Math.max((_b = record == null ? void 0 : record.remoteVersion) != null ? _b : 0, (_d = (_c = op.remote) == null ? void 0 : _c.ver) != null ? _d : 0) + 1;
     const uploaded = await this.encryptAndUpload(
       setup,
       op.path,
@@ -1882,7 +2019,7 @@ var SyncEngine = class _SyncEngine {
       remoteVersion: version
     };
     this.setMergeBase(op.path, entry, plaintext);
-    this.ctx.setJournalEntry(op.path, entry);
+    this.putRecord(op.path, entry);
     this.markJournalDirty();
     summary.pushed++;
     this.ctx.notify(`Conflict in ${op.path} resolved: your version was kept.`, 6e3);
@@ -1898,11 +2035,11 @@ var SyncEngine = class _SyncEngine {
    * With the interactive hook (IMP-2) the user picks the outcome instead.
    */
   async doConflict(op, setup, summary) {
-    var _a;
+    var _a, _b, _c, _d;
     if (!op.local) return;
     const local = this.ctx.app.vault.getAbstractFileByPath(op.local.path);
     if (!(local instanceof import_obsidian2.TFile)) return;
-    const record = this.ctx.getJournal()[op.path];
+    const record = this.recordFor(op.path);
     if (this.mergeBaseEnabled()) {
       const merged = await this.tryMarkdownMerge(op, setup, summary, record);
       if (merged) return;
@@ -1922,9 +2059,10 @@ var SyncEngine = class _SyncEngine {
       this.ctx.notify(`Conflict in ${op.path} resolved: the server version was kept.`, 6e3);
       return;
     }
-    const conflictPath = this.uniqueConflictPath(op.path);
+    const conflictLocal = this.uniqueConflictPath((_a = op.localPath) != null ? _a : op.path);
+    const conflictPath = op.config ? (_b = this.localPathToServer(conflictLocal)) != null ? _b : conflictLocal : conflictLocal;
     const localCopy = await this.ctx.app.vault.readBinary(local);
-    const version = ((_a = record == null ? void 0 : record.remoteVersion) != null ? _a : 0) + 1;
+    const version = ((_c = record == null ? void 0 : record.remoteVersion) != null ? _c : 0) + 1;
     const uploaded = await this.encryptAndUpload(
       setup,
       conflictPath,
@@ -1932,14 +2070,14 @@ var SyncEngine = class _SyncEngine {
       local.stat.mtime,
       version
     );
-    this.beginIgnore(conflictPath);
+    this.beginIgnore(conflictLocal);
     try {
-      await this.ctx.app.vault.createBinary(conflictPath, localCopy);
+      await this.ctx.app.vault.createBinary(conflictLocal, localCopy);
     } catch (error) {
-      this.ignorePaths.delete(conflictPath);
+      this.ignorePaths.delete(conflictLocal);
       throw error;
     }
-    const written = this.ctx.app.vault.getAbstractFileByPath(conflictPath);
+    const written = this.ctx.app.vault.getAbstractFileByPath(conflictLocal);
     const conflictEntry = {
       localMtime: written instanceof import_obsidian2.TFile ? written.stat.mtime : local.stat.mtime,
       remoteHash: uploaded.hash,
@@ -1947,51 +2085,55 @@ var SyncEngine = class _SyncEngine {
       remoteVersion: version
     };
     this.setMergeBase(conflictPath, conflictEntry, null);
-    this.ctx.setJournalEntry(conflictPath, conflictEntry);
+    this.putRecord(conflictPath, conflictEntry);
     this.markJournalDirty();
     await this.doPull({ ...op, local: void 0, remoteKey: op.remoteKey }, setup, summary);
     summary.conflicts++;
     this.ctx.notify(
-      `Conflict detected in file: ${op.path}
-Both versions kept \u2014 local copy saved as: ${conflictPath}`,
+      `Conflict detected in file: ${(_d = op.localPath) != null ? _d : op.path}
+Both versions kept \u2014 local copy saved as: ${conflictLocal}`,
       1e4
     );
   }
   /** Keep-both for two local files differing only by ASCII case (PROB-4). */
   async doCaseRename(op, summary) {
+    var _a, _b;
     const file = op.local instanceof import_obsidian2.TFile ? op.local : null;
-    const target = file != null ? file : this.ctx.app.vault.getAbstractFileByPath(op.path);
+    const target = file != null ? file : this.ctx.app.vault.getAbstractFileByPath((_a = op.localPath) != null ? _a : op.path);
     if (!(target instanceof import_obsidian2.TFile)) return;
-    const renamed = this.uniqueConflictPath(op.path, "_case-collision_");
-    this.beginIgnore(op.path);
+    const localPath = (_b = op.localPath) != null ? _b : op.path;
+    const renamed = this.uniqueConflictPath(localPath, "_case-collision_");
+    this.beginIgnore(localPath);
     this.beginIgnore(renamed);
     try {
       await this.ctx.app.vault.rename(target, renamed);
     } catch (error) {
-      this.ignorePaths.delete(op.path);
+      this.ignorePaths.delete(localPath);
       this.ignorePaths.delete(renamed);
       throw error;
     }
-    this.ctx.setJournalEntry(op.path, null);
+    this.putRecord(op.path, null);
     this.markJournalDirty();
     summary.conflicts++;
     this.ctx.notify(
-      `Case collision: "${op.path}" and another file differ only by letter case \u2014 renamed to "${renamed}" so both are kept.`,
+      `Case collision: "${localPath}" and another file differ only by letter case \u2014 renamed to "${renamed}" so both are kept.`,
       12e3
     );
   }
   async doDeleteLocal(op, summary) {
-    const file = this.ctx.app.vault.getAbstractFileByPath(op.local ? op.local.path : op.path);
+    var _a;
+    const localPath = (_a = op.localPath) != null ? _a : op.local ? op.local.path : op.path;
+    const file = this.ctx.app.vault.getAbstractFileByPath(localPath);
     if (file instanceof import_obsidian2.TFile) {
-      this.beginIgnore(op.path);
+      this.beginIgnore(localPath);
       try {
         await this.ctx.app.vault.trash(file, true);
       } catch (error) {
-        this.ignorePaths.delete(op.path);
+        this.ignorePaths.delete(localPath);
         throw error;
       }
     }
-    this.ctx.setJournalEntry(op.path, null);
+    this.putRecord(op.path, null);
     this.markJournalDirty();
     summary.deletedLocal++;
   }
@@ -2005,7 +2147,7 @@ Both versions kept \u2014 local copy saved as: ${conflictPath}`,
         throw error;
       }
     }
-    this.ctx.setJournalEntry(op.path, null);
+    this.putRecord(op.path, null);
     this.markJournalDirty();
     summary.deletedRemote++;
   }
@@ -2024,7 +2166,7 @@ Both versions kept \u2014 local copy saved as: ${conflictPath}`,
    * device on the server's current state.
    */
   async restoreFromServer(confirm) {
-    var _a, _b, _c;
+    var _a, _b, _c, _d, _e, _f, _g;
     const settings = this.ctx.getSettings();
     const password = (_a = this.passwordOverride) != null ? _a : settings.encryptionPassword;
     if (!settings.serverUrl || !settings.apiToken || !password) {
@@ -2050,10 +2192,19 @@ Both versions kept \u2014 local copy saved as: ${conflictPath}`,
       for (const path of Object.keys(this.ctx.getJournal())) {
         this.ctx.setJournalEntry(path, null);
       }
+      const cfgJournal = (_d = (_c = this.ctx).getConfigJournal) == null ? void 0 : _d.call(_c);
+      if (cfgJournal) {
+        for (const path of Object.keys(cfgJournal)) (_f = (_e = this.ctx).setConfigJournalEntry) == null ? void 0 : _f.call(_e, path, null);
+      }
       this.lastIndexEtag = "";
-      const remote = this.canonicalizeRemote((_c = index.files) != null ? _c : {});
+      const remoteAll = this.canonicalizeRemote((_g = index.files) != null ? _g : {});
+      const remote = /* @__PURE__ */ new Map();
+      for (const [key, entry] of remoteAll) {
+        if (!key.startsWith(_SyncEngine.CONFIG_PREFIX)) remote.set(key, entry);
+      }
       const ignores = await this.currentIgnoreMatcher();
       const plan = planSync(/* @__PURE__ */ new Map(), remote, {}, this.configDir, ignores);
+      plan.push(...this.planConfigSync(remoteAll, true));
       this.planLocals = this.collectLocalFiles(ignores);
       this.ctx.setStatus("syncing", `restoring ${liveCount} file(s)\u2026`);
       const summary = await this.executePlan(plan, setup);
@@ -2135,16 +2286,17 @@ Both versions kept \u2014 local copy saved as: ${conflictPath}`,
     const repaired = [];
     const skipped = [];
     await this.runPool(paths, 2, async (path) => {
-      var _a2;
+      var _a2, _b;
       try {
-        const file = this.ctx.app.vault.getAbstractFileByPath(path);
+        const localPath = (_a2 = this.serverPathToLocal(path)) != null ? _a2 : path;
+        const file = this.ctx.app.vault.getAbstractFileByPath(localPath);
         if (!(file instanceof import_obsidian2.TFile)) {
           skipped.push(path);
           return;
         }
         const plaintext = await this.ctx.app.vault.readBinary(file);
-        const record = this.ctx.getJournal()[path];
-        const version = ((_a2 = record == null ? void 0 : record.remoteVersion) != null ? _a2 : 0) + 1;
+        const record = this.recordFor(path);
+        const version = ((_b = record == null ? void 0 : record.remoteVersion) != null ? _b : 0) + 1;
         const uploaded = await this.encryptAndUpload(setup, path, plaintext, file.stat.mtime, version);
         const repairEntry = {
           localMtime: file.stat.mtime,
@@ -2153,7 +2305,7 @@ Both versions kept \u2014 local copy saved as: ${conflictPath}`,
           remoteVersion: version
         };
         this.setMergeBase(path, repairEntry, plaintext);
-        this.ctx.setJournalEntry(path, repairEntry);
+        this.putRecord(path, repairEntry);
         this.markJournalDirty();
         repaired.push(path);
       } catch (e) {
@@ -2251,7 +2403,7 @@ Both versions kept \u2014 local copy saved as: ${conflictPath}`,
         } else {
           plaintext = (await oldManager.decrypt(blob, path)).plaintext;
         }
-        const record = this.ctx.getJournal()[path];
+        const record = this.recordFor(path);
         const version = Math.max((_a = record == null ? void 0 : record.remoteVersion) != null ? _a : 0, (_b = entry.ver) != null ? _b : 0) + 1;
         const uploaded = await this.encryptAndUpload(newSetup, path, plaintext, Date.now(), version);
         const rotationEntry = {
@@ -2261,7 +2413,7 @@ Both versions kept \u2014 local copy saved as: ${conflictPath}`,
           remoteVersion: version
         };
         this.setMergeBase(path, rotationEntry, plaintext);
-        this.ctx.setJournalEntry(path, rotationEntry);
+        this.putRecord(path, rotationEntry);
         this.markJournalDirty();
         done++;
         if (done % 10 === 0 || done === remoteFiles.length) {
@@ -2518,6 +2670,9 @@ Both versions kept \u2014 local copy saved as: ${conflictPath}`,
     }
   }
 };
+// ------------------------------------------------ config namespace (IMP-6)
+_SyncEngine.CONFIG_PREFIX = "config/";
+var SyncEngine = _SyncEngine;
 
 // src/settings.ts
 var import_obsidian3 = require("obsidian");
@@ -2969,6 +3124,11 @@ var E2eeSyncPlugin = class extends import_obsidian4.Plugin {
       setJournalEntry: (path, record) => {
         if (record) this.journal[path] = record;
         else delete this.journal[path];
+      },
+      getConfigJournal: () => this.configJournal,
+      setConfigJournalEntry: (path, record) => {
+        if (record) this.configJournal[path] = record;
+        else delete this.configJournal[path];
       },
       persist: () => this.saveData({ settings: this.settings, journal: this.journal, configJournal: this.configJournal }),
       setStatus: (status, message) => this.updateStatus(status, message),

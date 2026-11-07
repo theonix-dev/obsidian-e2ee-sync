@@ -208,6 +208,7 @@ async function run() {
 
   const makeDevice = (name, vault, server, opts = {}) => {
     const journal = {};
+    const configJournal = {};
     const notices = [];
     const statuses = [];
     let persisted = 0;
@@ -218,14 +219,26 @@ async function run() {
       autoSyncMinutes: 0,
       rememberEncryptionPassword: true,
       enableMarkdownAutoMerge: opts.autoMerge === true,
+      ignorePatterns: '',
+      configSync: {
+        enabled: opts.configSync === true,
+        appearance: true, app: true, hotkeys: true, snippets: true,
+        themes: true, pluginCode: true, pluginData: false, workspace: false,
+        ...(opts.configOverrides ?? {}),
+      },
     };
     const eng = new SyncEngine({
       app: { vault },
-      getSettings: () => ({ ...settings }),
+      getSettings: () => ({ ...settings, configSync: { ...settings.configSync } }),
       getJournal: () => journal,
       setJournalEntry: (path, record) => {
         if (record) journal[path] = record;
         else delete journal[path];
+      },
+      getConfigJournal: () => configJournal,
+      setConfigJournalEntry: (path, record) => {
+        if (record) configJournal[path] = record;
+        else delete configJournal[path];
       },
       persist: async () => {
         persisted++;
@@ -237,7 +250,10 @@ async function run() {
       resolveConflict: opts.resolveConflict,
       setProgress: opts.setProgress,
     });
-    return { name, engine: eng, vault, journal, notices, statuses, settings, getPersisted: () => persisted };
+    return {
+      name, engine: eng, vault, journal, configJournal, notices, statuses, settings,
+      getPersisted: () => persisted,
+    };
   };
 
   /** runFullSync + loud diagnostics when it returns null. */
@@ -627,6 +643,100 @@ async function run() {
     await b.vault.trash(b.vault.getAbstractFileByPath('.syncignore'));
     await sync(b, 'B cycle without .syncignore');
     equal(b.journal['private/x.md']?.ignored, undefined, 'the flag clears when the path syncs again');
+  }
+
+  console.log('[14] IMP-6: config namespace round trip with default allowlist');
+  {
+    const server = new FakeServer(cryptoMod);
+    const a = makeDevice('A', new FakeVault(), server, { configSync: true });
+    const b = makeDevice('B', new FakeVault(), server, { configSync: true });
+
+    await a.vault.createBinary('.obsidian/appearance.json', utf8('{"theme":"obsidian"}\n'));
+    await a.vault.createBinary('.obsidian/app.json', utf8('{"promptDelete":false}\n'));
+    await a.vault.createBinary('.obsidian/plugins/foo/main.js', utf8('// plugin code\n'));
+    await a.vault.createBinary('.obsidian/plugins/foo/data.json', utf8('{"token":"secret"}\n'));
+    await a.vault.createBinary('.obsidian/workspace.json', utf8('{"tabs":[]}\n'));
+    await a.vault.createBinary('.obsidian/plugins/foo/README.md', utf8('never\n'));
+
+    const s1 = await sync(a, 'A config push');
+    equal(s1?.pushed, 3, 'exactly the allowlisted config files push');
+    ok([...server.files.keys()].includes('config/appearance.json'), 'appearance.json under config/');
+    ok([...server.files.keys()].includes('config/plugins/foo/main.js'), 'plugin code under config/');
+    ok(![...server.files.keys()].includes('config/plugins/foo/data.json'),
+      'plugin data.json stays device-local by default');
+    ok(![...server.files.keys()].includes('config/workspace.json'),
+      'workspace.json stays device-local by default');
+    ok(![...server.files.keys()].includes('config/plugins/foo/README.md'),
+      'unknown plugin files never sync');
+    ok(a.configJournal['config/appearance.json'] !== undefined,
+      'config records live in the separate journal section');
+    ok(a.journal['config/appearance.json'] === undefined,
+      'the vault journal stays clean of config paths');
+
+    const s2 = await sync(b, 'B config pull');
+    equal(s2?.pulled, 3, 'B pulls the allowlisted config files');
+    equal(await text(b, '.obsidian/appearance.json'), '{"theme":"obsidian"}\n',
+      'config lands under B\u2019s .obsidian folder');
+    ok(b.vault.getAbstractFileByPath('.obsidian/plugins/foo/data.json') === null,
+      'excluded files are never created on the other device');
+
+    // A config edit propagates both ways.
+    await b.vault.modifyBinary(b.vault.getAbstractFileByPath('.obsidian/app.json'), utf8('{"promptDelete":true}\n'));
+    await sync(b, 'B config push');
+    await sync(a, 'A config pull');
+    equal(await text(a, '.obsidian/app.json'), '{"promptDelete":true}\n', 'config edit propagated back to A');
+  }
+
+  console.log('[15] IMP-6: opt-in plugin data + real config-folder collision');
+  {
+    const server = new FakeServer(cryptoMod);
+    const optIn = makeDevice('A', new FakeVault(), server, {
+      configSync: true,
+      configOverrides: { pluginData: true, workspace: true },
+    });
+    await optIn.vault.createBinary('.obsidian/plugins/foo/data.json', utf8('{"k":"v"}\n'));
+    await optIn.vault.createBinary('.obsidian/workspace.json', utf8('{"tabs":[]}\n'));
+    await sync(optIn, 'opt-in push');
+    ok([...server.files.keys()].includes('config/plugins/foo/data.json'), 'plugin data.json syncs when opted in');
+    ok([...server.files.keys()].includes('config/workspace.json'), 'workspace.json syncs when opted in');
+
+    // A real vault folder named 'config' blocks the namespace.
+    const collide = makeDevice('B', new FakeVault(), server, { configSync: true });
+    await collide.vault.createFolder('config');
+    await collide.vault.createBinary('.obsidian/app.json', utf8('{}\n'));
+    const s3 = await sync(collide, 'collision cycle');
+    ok(
+      collide.notices.some((n) => n.includes('config" folder')),
+      'collision is reported to the user',
+    );
+    equal(s3?.pushed, 0, 'config sync skipped on collision');
+  }
+
+  console.log('[16] IMP-6: config deletions propagate; restore re-baselines config');
+  {
+    const server = new FakeServer(cryptoMod);
+    const a = makeDevice('A', new FakeVault(), server, { configSync: true });
+    const b = makeDevice('B', new FakeVault(), server, { configSync: true });
+
+    await a.vault.createBinary('.obsidian/appearance.json', utf8('{}\n'));
+    await a.vault.createBinary('.obsidian/hotkeys.json', utf8('{}\n'));
+    await sync(a, 'A push config');
+    await sync(b, 'B pull config');
+
+    // A deletes one config file locally (tracked) -> tombstone on the server.
+    await a.vault.trash(a.vault.getAbstractFileByPath('.obsidian/hotkeys.json'));
+    await sync(a, 'A delete config');
+    equal(server.files.get('config/hotkeys.json')?.entry.deleted, true, 'config deletion tombstoned');
+
+    const s1 = await sync(b, 'B learns the config deletion');
+    equal(s1?.deletedLocal, 1, 'B deletes its local config copy');
+    ok(b.vault.getAbstractFileByPath('.obsidian/hotkeys.json') === null, 'config file removed on B');
+
+    // Restore re-baselines the config namespace as well.
+    await b.vault.trash(b.vault.getAbstractFileByPath('.obsidian/appearance.json'));
+    const r = await b.engine.restoreFromServer();
+    equal(r?.pulled, 1, 'restore pulls the surviving config file back');
+    equal(await text(b, '.obsidian/appearance.json'), '{}\n', 'config content restored');
   }
 
   finish('engine.spec');
