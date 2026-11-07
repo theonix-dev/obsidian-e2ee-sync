@@ -42,11 +42,16 @@ export async function loadModule(relPath, { stub = true } = {}) {
   if (typeof globalThis.window === 'undefined') globalThis.window = globalThis;
 
   const entry = path.resolve(__dirname, '..', relPath);
-  const alias = {};
+  let stubMod = null;
+  const externals = [];
   if (stub) {
     const stubPath = path.join(buildDir, 'obsidian-stub.mjs');
     fs.writeFileSync(stubPath, STUB);
-    alias.obsidian = stubPath;
+    stubMod = await import(stubPath);
+    // Keep "obsidian" external so the bundle does not inline a private copy
+    // of the stub classes — specs import the same module file, and executor
+    // instanceof checks (TFile/TFolder) must see ONE class identity.
+    externals.push('obsidian');
   }
   const result = await build({
     entryPoints: [entry],
@@ -56,11 +61,12 @@ export async function loadModule(relPath, { stub = true } = {}) {
     target: 'node18',
     write: false,
     logLevel: 'silent',
-    alias,
+    external: externals,
   });
   const code = result.outputFiles[0].text;
   const mod = { exports: {} };
   const requireStub = (name) => {
+    if (name === 'obsidian' && stubMod) return stubMod;
     throw new Error(`Unexpected require("${name}") in the spec bundle`);
   };
   new Function('module', 'exports', 'require', code)(mod, mod.exports, requireStub);

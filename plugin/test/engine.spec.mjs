@@ -1,0 +1,323 @@
+/**
+ * Engine-level integration specs against a fake server + fake vault.
+ *
+ * Unlike planSync/crypto specs these exercise the REAL SyncEngine executor —
+ * journal updates, verifier seeding, keep-both conflicts, merge wiring —
+ * with genuine packet-v3 crypto (the WebCrypto of the host Node) and two
+ * "devices" sharing one in-memory server. The only substituted parts are the
+ * network transport (FakeServer implements the SyncApi surface) and the
+ * Obsidian vault (FakeVault, backed by the same TFile/TFolder stub the
+ * engine bundle sees — the executor instanceof-checks both).
+ */
+
+import { finish, loadModule, ok, equal } from './harness.mjs';
+
+const PASSWORD = 'engine-spec-password-0123456789';
+const VAULT_ID = 'engine-spec-vault-id-0123456789abcdef';
+const T0 = 1_700_000_000_000;
+
+class FakeVault {
+  constructor(configDir = '.obsidian') {
+    this.configDir = configDir;
+    this.now = T0;
+    this.files = new Map(); // path -> TFile
+    this.folders = new Set();
+    this.binaries = new Map(); // path -> ArrayBuffer
+  }
+
+  tick() {
+    this.now += 1000;
+    return this.now;
+  }
+
+  getAbstractFileByPath(p) {
+    if (this.files.has(p)) return this.files.get(p);
+    if (this.folders.has(p)) return new TFolder(p);
+    return null;
+  }
+
+  getFiles() {
+    return [...this.files.values()];
+  }
+
+  async readBinary(file) {
+    const data = this.binaries.get(file.path);
+    if (data === undefined) throw new Error(`FakeVault: missing binary ${file.path}`);
+    return data.slice(0);
+  }
+
+  async createBinary(path, data) {
+    const file = new TFile(path, this.tick());
+    file.stat.size = data.byteLength;
+    this.files.set(path, file);
+    this.binaries.set(path, data);
+    return file;
+  }
+
+  async modifyBinary(file, data) {
+    this.binaries.set(file.path, data);
+    file.stat.mtime = this.tick();
+    file.stat.size = data.byteLength;
+    return file;
+  }
+
+  async rename(file, newPath) {
+    this.files.delete(file.path);
+    this.binaries.set(newPath, this.binaries.get(file.path));
+    this.binaries.delete(file.path);
+    const copy = new TFile(newPath, file.stat.mtime);
+    copy.stat.size = file.stat.size;
+    this.files.set(newPath, copy);
+    return copy;
+  }
+
+  async trash(file) {
+    this.files.delete(file.path);
+    this.binaries.delete(file.path);
+  }
+
+  async createFolder(p) {
+    this.folders.add(p);
+  }
+}
+
+/** In-memory SyncApi stand-in shared by all devices (one server state). */
+class FakeServer {
+  constructor(cryptoMod) {
+    this.crypto = cryptoMod; // for hashing only
+    this.vaultId = VAULT_ID;
+    this.files = new Map(); // path -> { entry, bytes }
+    this.staging = new Map(); // uploadId -> { path, parts: Map, manifest, chunkCount }
+    this.uploadSeq = 0;
+  }
+
+  async sha256Hex(bytes) {
+    return this.crypto.sha256Hex(bytes);
+  }
+
+  async getMeta() {
+    return { vaultId: this.vaultId };
+  }
+
+  async getIndex() {
+    const files = {};
+    for (const [p, f] of this.files) files[p] = { ...f.entry };
+    return { index: { files }, etag: `etag-${this.files.size}`, notModified: false };
+  }
+
+  async upload(path, ciphertext, clientMtime, cipherHash, meta = {}) {
+    const bytes = new Uint8Array(ciphertext);
+    const hash = await this.sha256Hex(bytes);
+    if (cipherHash && cipherHash !== hash) throw new engine.ApiError('FakeServer: hash mismatch.', 400);
+    const entry = {
+      mtime: clientMtime,
+      size: bytes.length,
+      hash,
+      deleted: false,
+      keyId: meta.keyId ?? '',
+      ver: meta.fileVersion ?? 0,
+      manifest: '',
+    };
+    this.files.set(path, { entry, bytes: bytes.slice() });
+    return { path, ...entry };
+  }
+
+  async download(path) {
+    const f = this.files.get(path);
+    if (!f || f.entry.deleted) throw new engine.ApiError('File not found.', 404);
+    return f.bytes.slice().buffer;
+  }
+
+  async deleteFile(path) {
+    const f = this.files.get(path);
+    if (!f) throw new engine.ApiError('Unknown path.', 404);
+    if (f.entry.deleted) return { path, ...f.entry };
+    const tombstone = {
+      mtime: Date.now(), size: 0, hash: '', deleted: true, keyId: '', ver: 0, manifest: '',
+    };
+    this.files.set(path, { entry: tombstone, bytes: null });
+    return { path, ...tombstone };
+  }
+
+  async beginUpload(request) {
+    const uploadId = `upload-${String(++this.uploadSeq).padStart(6, '0')}`;
+    this.staging.set(uploadId, {
+      path: request.path,
+      chunkCount: request.chunkCount,
+      manifest: request.fileManifest,
+      parts: new Map(),
+    });
+    return { uploadId };
+  }
+
+  async uploadChunk(uploadId, n, chunk, chunkHash) {
+    const st = this.staging.get(uploadId);
+    if (!st) throw new engine.ApiError('Unknown uploadId.', 404);
+    const bytes = new Uint8Array(chunk);
+    if ((await this.sha256Hex(bytes)) !== chunkHash) throw new engine.ApiError('Chunk hash mismatch.', 400);
+    st.parts.set(n, bytes.slice());
+    return { accepted: [...st.parts.keys()].sort((a, b) => a - b) };
+  }
+
+  async uploadStatus(uploadId) {
+    const st = this.staging.get(uploadId);
+    if (!st) throw new engine.ApiError('Unknown uploadId.', 404);
+    return { accepted: [...st.parts.keys()].sort((a, b) => a - b), chunkCount: st.chunkCount };
+  }
+
+  async commitUpload(uploadId, meta) {
+    const st = this.staging.get(uploadId);
+    if (!st) throw new engine.ApiError('Unknown uploadId.', 404);
+    if (st.parts.size !== st.chunkCount) throw new engine.ApiError('Upload incomplete.', 400);
+    const ordered = [...st.parts.keys()].sort((a, b) => a - b);
+    const total = ordered.reduce((n2, k) => n2 + st.parts.get(k).length, 0);
+    const blob = new Uint8Array(total);
+    let o = 0;
+    for (const k of ordered) {
+      blob.set(st.parts.get(k), o);
+      o += st.parts.get(k).length;
+    }
+    this.staging.delete(uploadId);
+    const entry = {
+      mtime: meta.clientMtime,
+      size: total,
+      hash: await this.sha256Hex(blob),
+      deleted: false,
+      keyId: meta.keyId,
+      ver: meta.fileVersion,
+      manifest: st.manifest,
+    };
+    this.files.set(st.path, { entry, bytes: blob });
+    return { path: st.path, ...entry };
+  }
+}
+
+async function run() {
+  // Two module instances: the engine bundle (its own crypto/api inside) and a
+  // standalone crypto bundle for the spec's own hashing/sealing.
+  const engineMod = await loadModule('src/syncEngine.ts');
+  const cryptoMod = await loadModule('src/crypto.ts');
+  // The obsidian stub is (re)written by loadModule — import the SAME classes
+  // the engine bundle uses, so instanceof checks inside the executor hold.
+  ({ TFile, TFolder } = await import('./.build/obsidian-stub.mjs'));
+  // engineMod.ApiError is the SAME class the engine throws — required for the
+  // FakeServer's 404s to be recognized by the executor's instanceof checks.
+  engine = engineMod;
+  const { SyncEngine } = engineMod;
+  const { sha256Hex } = cryptoMod;
+
+  const makeDevice = (name, vault, server, opts = {}) => {
+    const journal = {};
+    const notices = [];
+    const statuses = [];
+    let persisted = 0;
+    const settings = {
+      serverUrl: 'https://sync.test',
+      apiToken: 'token-token-token',
+      encryptionPassword: PASSWORD,
+      autoSyncMinutes: 0,
+      rememberEncryptionPassword: true,
+      enableMarkdownAutoMerge: opts.autoMerge === true,
+    };
+    const eng = new SyncEngine({
+      app: { vault },
+      getSettings: () => ({ ...settings }),
+      getJournal: () => journal,
+      setJournalEntry: (path, record) => {
+        if (record) journal[path] = record;
+        else delete journal[path];
+      },
+      persist: async () => {
+        persisted++;
+      },
+      setStatus: (status, message) => statuses.push({ status, message }),
+      notify: (message) => notices.push(message),
+      confirmMassDeletion: async () => true,
+      createApi: () => server, // shared fake server = the network
+    });
+    return { name, engine: eng, vault, journal, notices, statuses, settings, getPersisted: () => persisted };
+  };
+
+  /** runFullSync + loud diagnostics when it returns null. */
+  const sync = async (device, label) => {
+    const summary = await device.engine.runFullSync();
+    if (summary === null) {
+      console.error(`  !! ${device.name} sync returned null (${label})`);
+      for (const n of device.notices.slice(-4)) console.error(`     notice: ${n}`);
+      for (const s of device.statuses.slice(-4)) console.error(`     status: ${s.status} ${s.message ?? ''}`);
+    }
+    return summary;
+  };
+
+  const utf8 = (s) => new TextEncoder().encode(s).buffer;
+  const text = async (device, path) =>
+    new TextDecoder().decode(await device.vault.readBinary(device.vault.getAbstractFileByPath(path)));
+
+  console.log('[1] two-device push/pull round trip (real v3 crypto, verifier seeding)');
+  {
+    const server = new FakeServer(cryptoMod);
+    const a = makeDevice('A', new FakeVault(), server);
+    const b = makeDevice('B', new FakeVault(), server);
+
+    await a.vault.createBinary('notes/hello.md', utf8('# Hello\n\nfrom device A\n'));
+    const s1 = await sync(a, 'initial push');
+    equal(s1?.pushed, 1, 'A pushes the new note');
+    equal(s1?.failures.length, 0, 'A has no failures');
+    equal(a.journal['notes/hello.md']?.remoteVersion, 1, 'A journals version 1');
+    ok(
+      [...server.files.keys()].some((p) => p.startsWith('.e2ee-verifier.')),
+      'A seeded its per-key verifier on the server',
+    );
+
+    const s2 = await sync(b, 'first pull');
+    equal(s2?.pulled, 1, 'B pulls the note');
+    equal(await text(b, 'notes/hello.md'), '# Hello\n\nfrom device A\n', 'B sees the exact plaintext');
+    equal(b.journal['notes/hello.md']?.remoteVersion, 1, 'B journals version 1');
+
+    await a.vault.modifyBinary(a.vault.getAbstractFileByPath('notes/hello.md'), utf8('# Hello\n\nedited on A\n'));
+    await sync(a, 'A edit push');
+    const s3 = await sync(b, 'B pull edit');
+    equal(s3?.pulled, 1, 'B pulls the edit');
+    equal(await text(b, 'notes/hello.md'), '# Hello\n\nedited on A\n', 'B sees the edit');
+
+    await b.vault.modifyBinary(b.vault.getAbstractFileByPath('notes/hello.md'), utf8('# Hello\n\nedited on B\n'));
+    await sync(b, 'B edit push');
+    const s4 = await sync(a, 'A pull edit');
+    equal(s4?.pulled, 1, 'A pulls B\u2019s edit');
+    equal(await text(a, 'notes/hello.md'), '# Hello\n\nedited on B\n', 'A sees B\u2019s edit');
+  }
+
+  console.log('[2] keep-both conflict when auto-merge is off (default)');
+  {
+    const server = new FakeServer(cryptoMod);
+    const a = makeDevice('A', new FakeVault(), server);
+    const b = makeDevice('B', new FakeVault(), server);
+
+    await a.vault.createBinary('note.md', utf8('line1\nline2\nline3\n'));
+    await sync(a, 'A initial');
+    await sync(b, 'B initial pull');
+
+    await a.vault.modifyBinary(a.vault.getAbstractFileByPath('note.md'), utf8('line1\nA-edits line2\nline3\n'));
+    await sync(a, 'A push v2');
+    await b.vault.modifyBinary(b.vault.getAbstractFileByPath('note.md'), utf8('line1\nB-edits line2\nline3\n'));
+    const summary = await sync(b, 'B conflict cycle');
+
+    equal(summary?.conflicts, 1, 'plans exactly one conflict');
+    equal(await text(b, 'note.md'), 'line1\nA-edits line2\nline3\n', 'remote wins the original path');
+    const copies = b.vault.getFiles().map((f) => f.path).filter((p) => p.includes('_conflict_'));
+    equal(copies.length, 1, 'local copy preserved as _conflict_ file');
+    equal(await text(b, copies[0]), 'line1\nB-edits line2\nline3\n', 'the conflict copy holds B\u2019s edits');
+    equal(server.files.get('note.md')?.entry.ver, 2, 'remote stays at v2');
+  }
+
+  finish('engine.spec');
+}
+
+let engine = null;
+let TFile = null;
+let TFolder = null;
+
+run().catch((err) => {
+  console.error('spec crashed:', err);
+  process.exit(1);
+});

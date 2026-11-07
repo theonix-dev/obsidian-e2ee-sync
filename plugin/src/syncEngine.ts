@@ -47,6 +47,10 @@
 import { TFile, TFolder, normalizePath } from 'obsidian';
 import type { App } from 'obsidian';
 import { ApiError, SyncApi } from './api';
+
+// Re-exported so embedders and specs can classify engine failures without a
+// second module instance of the api layer.
+export { ApiError };
 import {
   CryptoError,
   CryptoManager,
@@ -189,6 +193,11 @@ export interface EngineContext {
    * Ask the user; resolve with the password to use, or null to abort.
    */
   promptPassword?(reason: 'changed' | 'wrong'): Promise<string | null>;
+  /**
+   * Test seam: construct the REST client. Production callers omit it and the
+   * engine builds SyncApi itself; specs inject a fake server transport.
+   */
+  createApi?(serverUrl: string, token: string): SyncApi;
 }
 
 // ------------------------------------------------------------ pure planner --
@@ -1296,7 +1305,9 @@ export class SyncEngine {
   private ensureApi(settings: PluginSettings): SyncApi {
     const signature = `${settings.serverUrl}\u0000${settings.apiToken}`;
     if (!this.api || this.apiSignature !== signature) {
-      this.api = new SyncApi(settings.serverUrl, settings.apiToken);
+      this.api = this.ctx.createApi
+        ? this.ctx.createApi(settings.serverUrl, settings.apiToken)
+        : new SyncApi(settings.serverUrl, settings.apiToken);
       this.apiSignature = signature;
     }
     return this.api;
