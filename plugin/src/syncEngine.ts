@@ -1309,6 +1309,75 @@ export class SyncEngine {
     summary.deletedRemote++;
   }
 
+  // --------------------------------------------------- restore from server (IMP-4)
+
+  /**
+   * Fresh-clone path: wipe this device's sync journal and re-download every
+   * live file from the server. Never deletes — with an empty journal and an
+   * empty local snapshot the planner can only plan pulls, so the
+   * mass-deletion guard is inapplicable by construction. Existing local files
+   * are overwritten with the server copy (that is the point of a restore);
+   * local files absent from the server are left untouched.
+   *
+   * `confirm` receives the dry-run live-file count before anything is wiped;
+   * a false resolve aborts without changes. Rollback version checks do not
+   * apply to the wiped journal — a restore intentionally re-baselines the
+   * device on the server's current state.
+   */
+  async restoreFromServer(
+    confirm?: (liveCount: number) => Promise<boolean>,
+  ): Promise<{ pulled: number; failures: number } | null> {
+    const settings = this.ctx.getSettings();
+    const password = this.passwordOverride ?? settings.encryptionPassword;
+    if (!settings.serverUrl || !settings.apiToken || !password) {
+      this.ctx.notify('E2EE Sync: set server URL, API token and E2EE password in the plugin settings first.');
+      return null;
+    }
+    if (this.running) {
+      this.ctx.notify('E2EE Sync: a sync is already running — try again when it finishes.');
+      return null;
+    }
+    this.running = true;
+    try {
+      const api = this.ensureApi(settings);
+      const { index } = await api.getIndex(); // unconditional — no 304 shortcut
+      const setup = await this.ensureSetup(api, password, index);
+
+      const liveCount = Object.entries(index.files ?? {}).filter(
+        ([p, f]) => f && !f.deleted && !isVerifierPath(canonicalPath(p)),
+      ).length;
+      if (confirm && !(await confirm(liveCount))) {
+        this.ctx.setStatus('idle');
+        return null;
+      }
+
+      for (const path of Object.keys(this.ctx.getJournal())) {
+        this.ctx.setJournalEntry(path, null);
+      }
+      this.lastIndexEtag = '';
+
+      const remote = this.canonicalizeRemote(index.files ?? {});
+      const plan: PlannedOp[] = planSync(new Map(), remote, {}, this.configDir);
+      // planLocals feeds the write-time case-collision guard in doPull.
+      this.planLocals = this.collectLocalFiles();
+      this.ctx.setStatus('syncing', `restoring ${liveCount} file(s)…`);
+      const summary = await this.executePlan(plan, setup);
+      await this.flushJournal(true);
+      this.ctx.setStatus(
+        summary.failures.length === 0 ? 'synced' : 'error',
+        summary.failures.length === 0 ? undefined : `${summary.failures.length} file(s) failed`,
+      );
+      return { pulled: summary.pulled, failures: summary.failures.length };
+    } catch (error) {
+      this.ctx.setStatus('error', errorMessage(error));
+      this.ctx.notify(`E2EE Sync: restore failed — ${errorMessage(error)}`, 8000);
+      return null;
+    } finally {
+      this.planLocals = null;
+      this.running = false;
+    }
+  }
+
   // ---------------------------------------------------- integrity audit (PROB-10)
 
   /** Result of a full-store integrity verification. */

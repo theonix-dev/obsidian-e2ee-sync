@@ -292,6 +292,12 @@ export default class E2eeSyncPlugin extends Plugin {
       callback: () => this.runIntegrityCheck(),
     });
 
+    this.addCommand({
+      id: 'restore-from-server',
+      name: 'Restore from server',
+      callback: () => void this.runRestoreFromServer(),
+    });
+
     // Event subscriptions happen only once the vault is fully loaded,
     // otherwise initial indexing would masquerade as thousands of edits.
     this.app.workspace.onLayoutReady(() => this.onLayoutReady());
@@ -489,6 +495,35 @@ export default class E2eeSyncPlugin extends Plugin {
       this.setAutoSync(this.settings.autoSyncMinutes);
       this.engine.requestSync();
     }).open();
+  }
+
+  /**
+   * IMP-4: explicit fresh-clone path — wipe this device's journal and pull
+   * every live file. The engine reports the dry-run count into the dialog.
+   */
+  private async runRestoreFromServer(): Promise<void> {
+    if (!this.settings.serverUrl || !this.settings.apiToken || !this.effectivePassword) {
+      new Notice('E2EE Sync: configure the plugin before restoring.', 6000);
+      return;
+    }
+    this.updateStatus('syncing', 'preparing restore…');
+    const result = await this.engine.restoreFromServer(async (liveCount) =>
+      confirmDialog(
+        this.app,
+        'E2EE Sync: restore from server?',
+        `The server holds ${liveCount} file(s). This wipes this device's sync journal and re-downloads ` +
+          'everything from scratch. Local files are never deleted — files that already exist are ' +
+          'overwritten with the server copy, and files the server does not have stay where they are. ' +
+          'Use this on a new or broken device.',
+        'Restore now',
+      ),
+    );
+    if (!result) return; // cancelled or failed — the engine already notified
+    new Notice(
+      `E2EE Sync: restore finished — ${result.pulled} file(s) downloaded` +
+        (result.failures > 0 ? `, ${result.failures} failed.` : '.'),
+      10000,
+    );
   }
 
   /** (Re)install the periodic sync timer; minutes <= 0 disables it. */

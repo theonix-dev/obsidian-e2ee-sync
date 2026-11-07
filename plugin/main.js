@@ -1858,6 +1858,68 @@ Both versions kept \u2014 local copy saved as: ${conflictPath}`,
     this.markJournalDirty();
     summary.deletedRemote++;
   }
+  // --------------------------------------------------- restore from server (IMP-4)
+  /**
+   * Fresh-clone path: wipe this device's sync journal and re-download every
+   * live file from the server. Never deletes — with an empty journal and an
+   * empty local snapshot the planner can only plan pulls, so the
+   * mass-deletion guard is inapplicable by construction. Existing local files
+   * are overwritten with the server copy (that is the point of a restore);
+   * local files absent from the server are left untouched.
+   *
+   * `confirm` receives the dry-run live-file count before anything is wiped;
+   * a false resolve aborts without changes. Rollback version checks do not
+   * apply to the wiped journal — a restore intentionally re-baselines the
+   * device on the server's current state.
+   */
+  async restoreFromServer(confirm) {
+    var _a, _b, _c;
+    const settings = this.ctx.getSettings();
+    const password = (_a = this.passwordOverride) != null ? _a : settings.encryptionPassword;
+    if (!settings.serverUrl || !settings.apiToken || !password) {
+      this.ctx.notify("E2EE Sync: set server URL, API token and E2EE password in the plugin settings first.");
+      return null;
+    }
+    if (this.running) {
+      this.ctx.notify("E2EE Sync: a sync is already running \u2014 try again when it finishes.");
+      return null;
+    }
+    this.running = true;
+    try {
+      const api = this.ensureApi(settings);
+      const { index } = await api.getIndex();
+      const setup = await this.ensureSetup(api, password, index);
+      const liveCount = Object.entries((_b = index.files) != null ? _b : {}).filter(
+        ([p, f]) => f && !f.deleted && !isVerifierPath(canonicalPath(p))
+      ).length;
+      if (confirm && !await confirm(liveCount)) {
+        this.ctx.setStatus("idle");
+        return null;
+      }
+      for (const path of Object.keys(this.ctx.getJournal())) {
+        this.ctx.setJournalEntry(path, null);
+      }
+      this.lastIndexEtag = "";
+      const remote = this.canonicalizeRemote((_c = index.files) != null ? _c : {});
+      const plan = planSync(/* @__PURE__ */ new Map(), remote, {}, this.configDir);
+      this.planLocals = this.collectLocalFiles();
+      this.ctx.setStatus("syncing", `restoring ${liveCount} file(s)\u2026`);
+      const summary = await this.executePlan(plan, setup);
+      await this.flushJournal(true);
+      this.ctx.setStatus(
+        summary.failures.length === 0 ? "synced" : "error",
+        summary.failures.length === 0 ? void 0 : `${summary.failures.length} file(s) failed`
+      );
+      return { pulled: summary.pulled, failures: summary.failures.length };
+    } catch (error) {
+      this.ctx.setStatus("error", errorMessage(error));
+      this.ctx.notify(`E2EE Sync: restore failed \u2014 ${errorMessage(error)}`, 8e3);
+      return null;
+    } finally {
+      this.planLocals = null;
+      this.running = false;
+    }
+  }
   // ---------------------------------------------------- integrity audit (PROB-10)
   /** Result of a full-store integrity verification. */
   async verifyIntegrity() {
@@ -2697,6 +2759,11 @@ var E2eeSyncPlugin = class extends import_obsidian4.Plugin {
       name: "Verify vault integrity",
       callback: () => this.runIntegrityCheck()
     });
+    this.addCommand({
+      id: "restore-from-server",
+      name: "Restore from server",
+      callback: () => void this.runRestoreFromServer()
+    });
     this.app.workspace.onLayoutReady(() => this.onLayoutReady());
     this.updateStatus("idle");
   }
@@ -2867,6 +2934,30 @@ var E2eeSyncPlugin = class extends import_obsidian4.Plugin {
       this.setAutoSync(this.settings.autoSyncMinutes);
       this.engine.requestSync();
     }).open();
+  }
+  /**
+   * IMP-4: explicit fresh-clone path — wipe this device's journal and pull
+   * every live file. The engine reports the dry-run count into the dialog.
+   */
+  async runRestoreFromServer() {
+    if (!this.settings.serverUrl || !this.settings.apiToken || !this.effectivePassword) {
+      new import_obsidian4.Notice("E2EE Sync: configure the plugin before restoring.", 6e3);
+      return;
+    }
+    this.updateStatus("syncing", "preparing restore\u2026");
+    const result = await this.engine.restoreFromServer(
+      async (liveCount) => confirmDialog(
+        this.app,
+        "E2EE Sync: restore from server?",
+        `The server holds ${liveCount} file(s). This wipes this device's sync journal and re-downloads everything from scratch. Local files are never deleted \u2014 files that already exist are overwritten with the server copy, and files the server does not have stay where they are. Use this on a new or broken device.`,
+        "Restore now"
+      )
+    );
+    if (!result) return;
+    new import_obsidian4.Notice(
+      `E2EE Sync: restore finished \u2014 ${result.pulled} file(s) downloaded` + (result.failures > 0 ? `, ${result.failures} failed.` : "."),
+      1e4
+    );
   }
   /** (Re)install the periodic sync timer; minutes <= 0 disables it. */
   setAutoSync(minutes) {

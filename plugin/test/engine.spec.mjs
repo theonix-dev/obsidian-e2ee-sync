@@ -559,6 +559,46 @@ async function run() {
       'chunk events carry phase and path');
   }
 
+  console.log('[12] IMP-4: restore from server (fresh clone, never deletes)');
+  {
+    const server = new FakeServer(cryptoMod);
+    const a = makeDevice('A', new FakeVault(), server);
+    for (const p of ['a.md', 'b.md', 'dir/c.md']) {
+      await a.vault.createBinary(p, utf8(`content of ${p}\n`));
+    }
+    await sync(a, 'A pushes 3 files');
+
+    // Fresh device: restore pulls everything onto an empty vault.
+    const fresh = makeDevice('F', new FakeVault(), server);
+    const freshJournalBefore = Object.keys(fresh.journal).length;
+    const r1 = await fresh.engine.restoreFromServer(async (count) => {
+      equal(count, 3, 'dry-run count reports 3 live files');
+      return true;
+    });
+    equal(r1?.pulled, 3, 'restore pulled every live file');
+    equal(r1?.failures, 0, 'restore had no failures');
+    equal(freshJournalBefore, 0, 'journal started empty');
+    equal(await text(fresh, 'dir/c.md'), 'content of dir/c.md\n', 'restored content matches (nested path)');
+
+    // Device with stale state: journal wiped, files overwritten, local-only
+    // files and the tombstoned remote file are never deleted.
+    await a.vault.createBinary('a.md', utf8('stale local a\n'));
+    await a.vault.createBinary('local-only.md', utf8('keep me\n'));
+    a.journal['a.md'] = { localMtime: 1, remoteHash: 'deadbeef', remoteMtime: 1, remoteVersion: 99 };
+    const r2 = await a.engine.restoreFromServer();
+    equal(r2?.pulled, 3, 'stale device re-downloaded all 3 files');
+    equal(await text(a, 'a.md'), 'content of a.md\n', 'stale local file overwritten from the server');
+    equal(await text(a, 'local-only.md'), 'keep me\n', 'local-only file never deleted');
+    equal(a.journal['a.md']?.remoteVersion, 1, 'journal re-baselined on the server state');
+
+    // Declined confirmation: nothing is wiped, nothing is pulled.
+    const declined = makeDevice('D', new FakeVault(), server);
+    const r3 = await declined.engine.restoreFromServer(async () => false);
+    equal(r3, null, 'declined restore returns null');
+    equal(Object.keys(declined.journal).length, 0, 'declined restore leaves the journal untouched');
+    equal(declined.vault.getFiles().length, 0, 'declined restore pulls nothing');
+  }
+
   finish('engine.spec');
 }
 
