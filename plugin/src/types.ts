@@ -64,6 +64,12 @@ export interface PluginSettings {
   autoSyncMinutes: number;
   /** When false, the password is held in memory only, never in data.json. */
   rememberEncryptionPassword: boolean;
+  /**
+   * IMP-1: opt-in automatic three-way merge of Markdown conflicts. OFF by
+   * default — when on, the last synced copy of each .md note is stored as
+   * merge base (plaintext) in this plugin's data.json.
+   */
+  enableMarkdownAutoMerge: boolean;
 }
 
 export const DEFAULT_SETTINGS: PluginSettings = {
@@ -72,6 +78,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   encryptionPassword: '',
   autoSyncMinutes: 5,
   rememberEncryptionPassword: true,
+  enableMarkdownAutoMerge: false,
 };
 
 /** Shape of the plugin's persisted data.json. */

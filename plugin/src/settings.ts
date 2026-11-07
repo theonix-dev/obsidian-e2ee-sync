@@ -90,6 +90,20 @@ export class E2eeSyncSettingTab extends PluginSettingTab {
             },
           },
           {
+            name: 'Auto-merge Markdown conflicts',
+            desc:
+              'EXPERIMENTAL, off by default. When two devices edit different parts of the same note, ' +
+              'the changes are merged automatically instead of keeping both copies (overlapping edits ' +
+              'still keep both). Trade-off: to compute a merge this device stores a plaintext copy of ' +
+              'the last synced state of every .md note in the plugin\u2019s data.json — unencrypted at rest ' +
+              'inside your vault (the notes themselves are plaintext there too, but tools that read ' +
+              'data.json would see note content even if the notes were moved elsewhere).',
+            control: {
+              type: 'toggle',
+              key: 'enableMarkdownAutoMerge',
+            },
+          },
+          {
             name: 'Test connection',
             desc: 'Checks reachability, the API token and key derivation (GET /api/index).',
             action: () => {
