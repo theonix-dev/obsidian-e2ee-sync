@@ -282,6 +282,38 @@ async function run() {
       'without a matcher the planner behaves exactly as before');
   }
 
+  console.log('[9] config-namespace allowlist (IMP-6)');
+  {
+    const { isConfigSyncablePath } = engine;
+    const allow = (over = {}) => ({
+      enabled: true, appearance: true, app: true, hotkeys: true, snippets: true,
+      themes: true, pluginCode: true, pluginData: false, workspace: false, ...over,
+    });
+    const off = { ...allow(), enabled: false };
+    ok(!isConfigSyncablePath('appearance.json', off), 'master switch gates everything');
+
+    ok(isConfigSyncablePath('appearance.json', allow()), 'appearance.json allowed by default');
+    ok(isConfigSyncablePath('app.json', allow()), 'app.json allowed by default');
+    ok(isConfigSyncablePath('hotkeys.json', allow()), 'hotkeys.json allowed by default');
+    ok(isConfigSyncablePath('snippets/my.css', allow()), 'snippets/ allowed by default');
+    ok(isConfigSyncablePath('themes/x/theme.css', allow()), 'themes/ allowed by default');
+    ok(isConfigSyncablePath('plugins/foo/main.js', allow()), 'plugin main.js allowed by default');
+    ok(isConfigSyncablePath('plugins/foo/manifest.json', allow()), 'plugin manifest allowed by default');
+    ok(isConfigSyncablePath('plugins/foo/styles.css', allow()), 'plugin styles allowed by default');
+
+    ok(!isConfigSyncablePath('plugins/foo/data.json', allow()), 'plugin data.json excluded by default');
+    ok(isConfigSyncablePath('plugins/foo/data.json', allow({ pluginData: true })),
+      'plugin data.json opt-in per checkbox');
+    ok(!isConfigSyncablePath('workspace.json', allow()), 'workspace.json excluded by default');
+    ok(isConfigSyncablePath('workspace.json', allow({ workspace: true })), 'workspace.json opt-in');
+
+    ok(!isConfigSyncablePath('workspace.json.bak', allow()), 'unknown root files never sync');
+    ok(!isConfigSyncablePath('plugins/foo/README.md', allow()), 'unknown plugin files never sync');
+    ok(!isConfigSyncablePath('plugins/foo/sub/x.js', allow()), 'nested plugin files never sync');
+    ok(!isConfigSyncablePath('random.json', allow()), 'unrecognized paths never sync');
+    ok(!isConfigSyncablePath('snippets', allow()), 'the folder itself is not a syncable file');
+  }
+
   finish('planSync.spec');
 }
 

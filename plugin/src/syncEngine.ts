@@ -61,7 +61,7 @@ import {
   sha256Hex,
   toHex,
 } from './crypto';
-import type { PluginSettings, RemoteFileInfo, RemoteIndex, SyncRecord, SyncStatus } from './types';
+import type { ConfigSyncSettings, PluginSettings, RemoteFileInfo, RemoteIndex, SyncRecord, SyncStatus } from './types';
 import { ignoreMatcherFromSources } from './ignore';
 import type { IgnoreMatcher } from './ignore';
 import { MERGE_MAX_BYTES, merge3 } from './merge';
@@ -144,6 +144,39 @@ export function isSyncablePath(p: string, configDir: string, ignores?: IgnoreMat
   }
   if (ignores?.isIgnored(p)) return false;
   return true;
+}
+
+/**
+ * IMP-6 — allowlist for one path relative to the configuration folder
+ * (.obsidian/). Only known groups sync at all; the device-local,
+ * dangerous-to-propagate entries (plugins/<id>/data.json, workspace.json) are
+ * opt-in per checkbox; anything unrecognized (unknown plugin files, random
+ * hidden files) never syncs.
+ */
+export function isConfigSyncablePath(rest: string, allow: ConfigSyncSettings): boolean {
+  if (!allow.enabled) return false;
+  const segs = rest.split('/').filter((s) => s !== '');
+  if (segs.length === 0) return false;
+  const top = segs[0];
+  if (segs.length === 1) {
+    if (top === 'workspace.json') return allow.workspace;
+    if (top === 'appearance.json') return allow.appearance;
+    if (top === 'app.json') return allow.app;
+    if (top === 'hotkeys.json') return allow.hotkeys;
+    return false;
+  }
+  if (top === 'snippets') return allow.snippets;
+  if (top === 'themes') return allow.themes;
+  if (top === 'plugins') {
+    if (segs.length !== 3) return false; // exactly plugins/<id>/<file>
+    const file = segs[2];
+    if (file === 'data.json') return allow.pluginData;
+    if (file === 'main.js' || file === 'manifest.json' || file === 'styles.css') {
+      return allow.pluginCode;
+    }
+    return false;
+  }
+  return false;
 }
 
 export type SyncAction =

@@ -117,6 +117,60 @@ export class E2eeSyncSettingTab extends PluginSettingTab {
             },
           },
           {
+            name: 'Sync hidden configuration (experimental)',
+            desc:
+              'Syncs allowlisted files from the .obsidian folder through a separate "config/" namespace ' +
+              '(same encryption, separate journal section). Default groups: appearance.json, app.json, ' +
+              'hotkeys.json, snippets/, themes/ and plugin code (main.js, manifest.json, styles.css). ' +
+              'plugins/<id>/data.json and workspace.json stay device-local unless you opt in — they can ' +
+              'propagate secrets or per-device UI state between machines.',
+            control: {
+              type: 'toggle',
+              key: 'configSync.enabled',
+            },
+          },
+          {
+            name: 'appearance.json',
+            desc: 'Theme selection and appearance settings.',
+            control: { type: 'toggle', key: 'configSync.appearance' },
+          },
+          {
+            name: 'app.json',
+            desc: 'Core app settings (editor behaviour, attachment folder…).',
+            control: { type: 'toggle', key: 'configSync.app' },
+          },
+          {
+            name: 'hotkeys.json',
+            desc: 'Custom keyboard shortcuts.',
+            control: { type: 'toggle', key: 'configSync.hotkeys' },
+          },
+          {
+            name: 'snippets/',
+            desc: 'CSS snippets.',
+            control: { type: 'toggle', key: 'configSync.snippets' },
+          },
+          {
+            name: 'themes/',
+            desc: 'Installed themes.',
+            control: { type: 'toggle', key: 'configSync.themes' },
+          },
+          {
+            name: 'Plugin code (main.js / manifest.json / styles.css)',
+            desc: 'Installed community plugin bundles — lets a new device skip re-downloading plugins.',
+            control: { type: 'toggle', key: 'configSync.pluginCode' },
+          },
+          {
+            name: 'Plugin data (plugins/<id>/data.json)',
+            desc: 'CAUTION: plugin settings may contain tokens/secrets and are not designed to merge ' +
+              'across devices. Off by default.',
+            control: { type: 'toggle', key: 'configSync.pluginData' },
+          },
+          {
+            name: 'workspace.json',
+            desc: 'CAUTION: open tabs and layout are per-device by design. Off by default.',
+            control: { type: 'toggle', key: 'configSync.workspace' },
+          },
+          {
             name: 'Test connection',
             desc: 'Checks reachability, the API token and key derivation (GET /api/index).',
             action: () => {
@@ -143,11 +197,29 @@ export class E2eeSyncSettingTab extends PluginSettingTab {
   }
 
   getControlValue(key: string): unknown {
+    // Dotted keys address the nested configSync groups (IMP-6).
+    const dot = key.indexOf('.');
+    if (dot > 0) {
+      const [group, field] = [key.slice(0, dot), key.slice(dot + 1)];
+      const nested = (this.plugin.settings as unknown as Record<string, Record<string, unknown>>)[group];
+      return nested?.[field];
+    }
     return (this.plugin.settings as unknown as Record<string, unknown>)[key];
   }
 
   async setControlValue(key: string, value: unknown): Promise<void> {
     const plugin = this.plugin;
+
+    const dot = key.indexOf('.');
+    if (dot > 0) {
+      const [group, field] = [key.slice(0, dot), key.slice(dot + 1)];
+      const nested = (plugin.settings as unknown as Record<string, Record<string, unknown>>)[group];
+      if (nested) {
+        nested[field] = value;
+        await plugin.saveSettings();
+      }
+      return;
+    }
 
     // The E2EE password may live in memory only (session-only mode).
     if (key === 'encryptionPassword') {

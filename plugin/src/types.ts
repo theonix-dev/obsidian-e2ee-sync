@@ -62,6 +62,44 @@ export interface SyncRecord {
 
 export type SyncStatus = 'idle' | 'syncing' | 'synced' | 'error' | 'offline';
 
+/**
+ * IMP-6: per-group allowlist of the hidden configuration folder
+ * (.obsidian/). Device-local, dangerous-to-propagate entries are excluded by
+ * default; everything outside the known groups never syncs.
+ */
+export interface ConfigSyncSettings {
+  /** Master switch — off by default. */
+  enabled: boolean;
+  /** appearance.json */
+  appearance: boolean;
+  /** app.json */
+  app: boolean;
+  /** hotkeys.json */
+  hotkeys: boolean;
+  /** snippets/ */
+  snippets: boolean;
+  /** themes/ */
+  themes: boolean;
+  /** plugins/<id>/{main.js,manifest.json,styles.css} */
+  pluginCode: boolean;
+  /** plugins/<id>/data.json — device-local by default (opt in deliberately). */
+  pluginData: boolean;
+  /** workspace.json — device-local by default (opt in deliberately). */
+  workspace: boolean;
+}
+
+export const DEFAULT_CONFIG_SYNC: ConfigSyncSettings = {
+  enabled: false,
+  appearance: true,
+  app: true,
+  hotkeys: true,
+  snippets: true,
+  themes: true,
+  pluginCode: true,
+  pluginData: false,
+  workspace: false,
+};
+
 export interface PluginSettings {
   /** Base URL of the sync server, e.g. https://sync.example.com */
   serverUrl: string;
@@ -88,6 +126,8 @@ export interface PluginSettings {
    * sync. Merged with the vault-root `.syncignore` file at every cycle.
    */
   ignorePatterns: string;
+  /** IMP-6: hidden-configuration (.obsidian/) sync groups. */
+  configSync: ConfigSyncSettings;
 }
 
 export const DEFAULT_SETTINGS: PluginSettings = {
@@ -98,10 +138,13 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   rememberEncryptionPassword: true,
   enableMarkdownAutoMerge: false,
   ignorePatterns: '',
+  configSync: DEFAULT_CONFIG_SYNC,
 };
 
 /** Shape of the plugin's persisted data.json. */
 export interface PluginData {
   settings?: Partial<PluginSettings>;
   journal?: Record<string, SyncRecord>;
+  /** IMP-6: separate journal section for the config/ server namespace. */
+  configJournal?: Record<string, SyncRecord>;
 }

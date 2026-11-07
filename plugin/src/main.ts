@@ -13,7 +13,7 @@ import type { App } from 'obsidian';
 import { SyncEngine, canonicalPath } from './syncEngine';
 import type { ConflictResolution } from './syncEngine';
 import { E2eeSyncSettingTab } from './settings';
-import { DEFAULT_SETTINGS } from './types';
+import { DEFAULT_CONFIG_SYNC, DEFAULT_SETTINGS } from './types';
 import type { PluginData, PluginSettings, SyncRecord, SyncStatus } from './types';
 import type { ProgressLike } from './util';
 import { errorMessage, formatProgress } from './util';
@@ -200,6 +200,8 @@ class ConflictModal extends Modal {
 export default class E2eeSyncPlugin extends Plugin {
   settings: PluginSettings = { ...DEFAULT_SETTINGS };
   journal: Record<string, SyncRecord> = {};
+  /** IMP-6: separate journal section for the config/ server namespace. */
+  configJournal: Record<string, SyncRecord> = {};
   engine!: SyncEngine;
 
   /** Live password when rememberEncryptionPassword is false (never persisted). */
@@ -220,8 +222,14 @@ export default class E2eeSyncPlugin extends Plugin {
 
   async onload(): Promise<void> {
     const data: PluginData = (await this.loadData()) ?? {};
-    this.settings = { ...DEFAULT_SETTINGS, ...(data.settings ?? {}) };
+    this.settings = {
+      ...DEFAULT_SETTINGS,
+      ...(data.settings ?? {}),
+      // Nested group defaults survive partial persisted configSync objects.
+      configSync: { ...DEFAULT_CONFIG_SYNC, ...(data.settings?.configSync ?? {}) },
+    };
     this.journal = data.journal ?? {};
+    this.configJournal = data.configJournal ?? {};
 
     // Migrate pre-NFC journal keys so records survive the canonicalization of
     // paths (iOS/macOS NFD spellings now share one canonical key). Records
@@ -244,7 +252,7 @@ export default class E2eeSyncPlugin extends Plugin {
         if (record) this.journal[path] = record;
         else delete this.journal[path];
       },
-      persist: () => this.saveData({ settings: this.settings, journal: this.journal }),
+      persist: () => this.saveData({ settings: this.settings, journal: this.journal, configJournal: this.configJournal }),
       setStatus: (status, message) => this.updateStatus(status, message),
       notify: (message, timeout) => new Notice(message, timeout ?? 6000),
       confirmMassDeletion: (deletedCount, localCount) =>
@@ -308,7 +316,7 @@ export default class E2eeSyncPlugin extends Plugin {
   onunload(): void {
     // Persist any journal mutations since the last engine flush (up to 19 ops
     // can otherwise be lost when Obsidian closes mid-sync).
-    void this.saveData({ settings: this.settings, journal: this.journal }).catch(() => {});
+    void this.saveData({ settings: this.settings, journal: this.journal, configJournal: this.configJournal }).catch(() => {});
     this.engine?.dispose();
     if (this.autoSyncTimer !== null) window.clearInterval(this.autoSyncTimer);
     for (const t of this.oneShotTimers) window.clearTimeout(t);
@@ -324,7 +332,7 @@ export default class E2eeSyncPlugin extends Plugin {
         ? this.settings.encryptionPassword
         : '', // session-only mode: the password never reaches data.json
     };
-    await this.saveData({ settings, journal: this.journal });
+    await this.saveData({ settings, journal: this.journal, configJournal: this.configJournal });
   }
 
   /**

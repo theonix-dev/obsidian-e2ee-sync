@@ -2607,6 +2607,54 @@ var E2eeSyncSettingTab = class extends import_obsidian3.PluginSettingTab {
             }
           },
           {
+            name: "Sync hidden configuration (experimental)",
+            desc: 'Syncs allowlisted files from the .obsidian folder through a separate "config/" namespace (same encryption, separate journal section). Default groups: appearance.json, app.json, hotkeys.json, snippets/, themes/ and plugin code (main.js, manifest.json, styles.css). plugins/<id>/data.json and workspace.json stay device-local unless you opt in \u2014 they can propagate secrets or per-device UI state between machines.',
+            control: {
+              type: "toggle",
+              key: "configSync.enabled"
+            }
+          },
+          {
+            name: "appearance.json",
+            desc: "Theme selection and appearance settings.",
+            control: { type: "toggle", key: "configSync.appearance" }
+          },
+          {
+            name: "app.json",
+            desc: "Core app settings (editor behaviour, attachment folder\u2026).",
+            control: { type: "toggle", key: "configSync.app" }
+          },
+          {
+            name: "hotkeys.json",
+            desc: "Custom keyboard shortcuts.",
+            control: { type: "toggle", key: "configSync.hotkeys" }
+          },
+          {
+            name: "snippets/",
+            desc: "CSS snippets.",
+            control: { type: "toggle", key: "configSync.snippets" }
+          },
+          {
+            name: "themes/",
+            desc: "Installed themes.",
+            control: { type: "toggle", key: "configSync.themes" }
+          },
+          {
+            name: "Plugin code (main.js / manifest.json / styles.css)",
+            desc: "Installed community plugin bundles \u2014 lets a new device skip re-downloading plugins.",
+            control: { type: "toggle", key: "configSync.pluginCode" }
+          },
+          {
+            name: "Plugin data (plugins/<id>/data.json)",
+            desc: "CAUTION: plugin settings may contain tokens/secrets and are not designed to merge across devices. Off by default.",
+            control: { type: "toggle", key: "configSync.pluginData" }
+          },
+          {
+            name: "workspace.json",
+            desc: "CAUTION: open tabs and layout are per-device by design. Off by default.",
+            control: { type: "toggle", key: "configSync.workspace" }
+          },
+          {
             name: "Test connection",
             desc: "Checks reachability, the API token and key derivation (GET /api/index).",
             action: () => {
@@ -2629,10 +2677,26 @@ var E2eeSyncSettingTab = class extends import_obsidian3.PluginSettingTab {
     ];
   }
   getControlValue(key) {
+    const dot = key.indexOf(".");
+    if (dot > 0) {
+      const [group, field] = [key.slice(0, dot), key.slice(dot + 1)];
+      const nested = this.plugin.settings[group];
+      return nested == null ? void 0 : nested[field];
+    }
     return this.plugin.settings[key];
   }
   async setControlValue(key, value) {
     const plugin = this.plugin;
+    const dot = key.indexOf(".");
+    if (dot > 0) {
+      const [group, field] = [key.slice(0, dot), key.slice(dot + 1)];
+      const nested = plugin.settings[group];
+      if (nested) {
+        nested[field] = value;
+        await plugin.saveSettings();
+      }
+      return;
+    }
     if (key === "encryptionPassword") {
       const password = String(value != null ? value : "");
       const oldPassword = plugin.effectivePassword;
@@ -2685,6 +2749,17 @@ var E2eeSyncSettingTab = class extends import_obsidian3.PluginSettingTab {
 };
 
 // src/types.ts
+var DEFAULT_CONFIG_SYNC = {
+  enabled: false,
+  appearance: true,
+  app: true,
+  hotkeys: true,
+  snippets: true,
+  themes: true,
+  pluginCode: true,
+  pluginData: false,
+  workspace: false
+};
 var DEFAULT_SETTINGS = {
   serverUrl: "",
   apiToken: "",
@@ -2692,7 +2767,8 @@ var DEFAULT_SETTINGS = {
   autoSyncMinutes: 5,
   rememberEncryptionPassword: true,
   enableMarkdownAutoMerge: false,
-  ignorePatterns: ""
+  ignorePatterns: "",
+  configSync: DEFAULT_CONFIG_SYNC
 };
 
 // src/main.ts
@@ -2852,6 +2928,8 @@ var E2eeSyncPlugin = class extends import_obsidian4.Plugin {
     super(...arguments);
     this.settings = { ...DEFAULT_SETTINGS };
     this.journal = {};
+    /** IMP-6: separate journal section for the config/ server namespace. */
+    this.configJournal = {};
     /** Live password when rememberEncryptionPassword is false (never persisted). */
     this.sessionPassword = "";
     this.statusBarEl = null;
@@ -2865,16 +2943,22 @@ var E2eeSyncPlugin = class extends import_obsidian4.Plugin {
     return this.settings.rememberEncryptionPassword ? this.settings.encryptionPassword : this.sessionPassword;
   }
   async onload() {
-    var _a, _b, _c, _d;
+    var _a, _b, _c, _d, _e, _f, _g;
     const data = (_a = await this.loadData()) != null ? _a : {};
-    this.settings = { ...DEFAULT_SETTINGS, ...(_b = data.settings) != null ? _b : {} };
-    this.journal = (_c = data.journal) != null ? _c : {};
+    this.settings = {
+      ...DEFAULT_SETTINGS,
+      ...(_b = data.settings) != null ? _b : {},
+      // Nested group defaults survive partial persisted configSync objects.
+      configSync: { ...DEFAULT_CONFIG_SYNC, ...(_d = (_c = data.settings) == null ? void 0 : _c.configSync) != null ? _d : {} }
+    };
+    this.journal = (_e = data.journal) != null ? _e : {};
+    this.configJournal = (_f = data.configJournal) != null ? _f : {};
     for (const key of Object.keys(this.journal)) {
       const canonical = canonicalPath(key);
       const record = this.journal[key];
       delete this.journal[key];
       if (record) {
-        (_d = record.remoteVersion) != null ? _d : record.remoteVersion = 0;
+        (_g = record.remoteVersion) != null ? _g : record.remoteVersion = 0;
         if (!this.journal[canonical]) this.journal[canonical] = record;
       }
     }
@@ -2886,7 +2970,7 @@ var E2eeSyncPlugin = class extends import_obsidian4.Plugin {
         if (record) this.journal[path] = record;
         else delete this.journal[path];
       },
-      persist: () => this.saveData({ settings: this.settings, journal: this.journal }),
+      persist: () => this.saveData({ settings: this.settings, journal: this.journal, configJournal: this.configJournal }),
       setStatus: (status, message) => this.updateStatus(status, message),
       notify: (message, timeout) => new import_obsidian4.Notice(message, timeout != null ? timeout : 6e3),
       confirmMassDeletion: (deletedCount, localCount) => confirmDialog(
@@ -2931,7 +3015,7 @@ var E2eeSyncPlugin = class extends import_obsidian4.Plugin {
   }
   onunload() {
     var _a;
-    void this.saveData({ settings: this.settings, journal: this.journal }).catch(() => {
+    void this.saveData({ settings: this.settings, journal: this.journal, configJournal: this.configJournal }).catch(() => {
     });
     (_a = this.engine) == null ? void 0 : _a.dispose();
     if (this.autoSyncTimer !== null) window.clearInterval(this.autoSyncTimer);
@@ -2945,7 +3029,7 @@ var E2eeSyncPlugin = class extends import_obsidian4.Plugin {
       encryptionPassword: this.settings.rememberEncryptionPassword ? this.settings.encryptionPassword : ""
       // session-only mode: the password never reaches data.json
     };
-    await this.saveData({ settings, journal: this.journal });
+    await this.saveData({ settings, journal: this.journal, configJournal: this.configJournal });
   }
   /**
    * PROB-1: a password change no longer resets the journal — it streams a
