@@ -641,6 +641,264 @@ var CryptoManager = class {
   }
 };
 
+// src/merge.ts
+var MERGE_MAX_BYTES = 512 * 1024;
+var MAX_DIFF_D = 2048;
+function splitLines(text) {
+  const lines = [];
+  const parts = text.split("\n");
+  let trailingNewline = false;
+  if (parts.length > 0 && parts[parts.length - 1] === "") {
+    trailingNewline = true;
+    parts.pop();
+  }
+  let crlf = 0;
+  let lf = 0;
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    const hadEol = i < parts.length - 1 || trailingNewline;
+    if (part.endsWith("\r")) {
+      if (hadEol) crlf++;
+      lines.push(part.slice(0, -1));
+    } else {
+      if (hadEol) lf++;
+      lines.push(part);
+    }
+  }
+  const eol = crlf + lf === 0 ? null : crlf > lf ? "\r\n" : "\n";
+  return { lines, trailingNewline, eol };
+}
+function matchMap(a, b, maxD) {
+  const n = a.length;
+  const m = b.length;
+  const out = new Int32Array(n).fill(-1);
+  if (n === 0 && m === 0) return out;
+  if (n === 0 || m === 0) return out;
+  const dCap = Math.min(maxD, n + m);
+  const offset = dCap;
+  const v = new Int32Array(2 * dCap + 1);
+  const trace = [];
+  let foundD = -1;
+  for (let d = 0; d <= dCap; d++) {
+    trace.push(v.slice(offset - d, offset + d + 1));
+    for (let k = -d; k <= d; k += 2) {
+      let x2;
+      if (k === -d || k !== d && v[offset + k - 1] < v[offset + k + 1]) {
+        x2 = v[offset + k + 1];
+      } else {
+        x2 = v[offset + k - 1] + 1;
+      }
+      let y2 = x2 - k;
+      while (x2 < n && y2 < m && a[x2] === b[y2]) {
+        x2++;
+        y2++;
+      }
+      v[offset + k] = x2;
+      if (x2 >= n && y2 >= m) {
+        foundD = d;
+        break;
+      }
+    }
+    if (foundD >= 0) break;
+  }
+  if (foundD < 0) return null;
+  const pairs = [];
+  let x = n;
+  let y = m;
+  for (let d = foundD; d >= 0; d--) {
+    if (d === 0) {
+      while (x > 0 && y > 0) {
+        pairs.push(x - 1, y - 1);
+        x--;
+        y--;
+      }
+      break;
+    }
+    const vt = trace[d];
+    const k = x - y;
+    const goDown = k === -d || k !== d && vt[k - 1 + d] < vt[k + 1 + d];
+    const prevK = goDown ? k + 1 : k - 1;
+    const prevX = vt[prevK + d];
+    const prevY = prevX - prevK;
+    while (x > prevX && y > prevY) {
+      pairs.push(x - 1, y - 1);
+      x--;
+      y--;
+    }
+    x = prevX;
+    y = prevY;
+  }
+  for (let i = 0; i < pairs.length; i += 2) {
+    out[pairs[i]] = pairs[i + 1];
+  }
+  return out;
+}
+function listEquals(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+function sideHunks(matches, side) {
+  const hunks = [];
+  const n = matches.length;
+  if (n === 0) {
+    if (side.length > 0) {
+      hunks.push({ baseStart: 0, baseEnd: 0, sideStart: 0, sideEnd: side.length });
+    }
+    return hunks;
+  }
+  let prevMatch = -1;
+  let lastMatchedBase = -1;
+  for (let i2 = 0; i2 < n; i2++) {
+    const m = matches[i2];
+    if (m === -1) continue;
+    if (i2 === 0) {
+      if (m > 0) {
+        hunks.push({ baseStart: 0, baseEnd: 0, sideStart: 0, sideEnd: m });
+      }
+    } else if (i2 - lastMatchedBase === 1 && prevMatch >= 0 && m - prevMatch > 1) {
+      hunks.push({ baseStart: i2, baseEnd: i2, sideStart: prevMatch + 1, sideEnd: m });
+    }
+    prevMatch = m;
+    lastMatchedBase = i2;
+  }
+  if (matches[n - 1] !== -1 && prevMatch < side.length - 1) {
+    hunks.push({ baseStart: n, baseEnd: n, sideStart: prevMatch + 1, sideEnd: side.length });
+  }
+  let i = 0;
+  while (i < n) {
+    if (matches[i] !== -1) {
+      i++;
+      continue;
+    }
+    let j = i;
+    while (j < n && matches[j] === -1) j++;
+    hunks.push({
+      baseStart: i,
+      baseEnd: j,
+      sideStart: i === 0 ? 0 : matches[i - 1] + 1,
+      sideEnd: j === n ? side.length : matches[j]
+    });
+    i = j;
+  }
+  return hunks.sort((a, b) => a.baseStart - b.baseStart || a.baseEnd - b.baseEnd);
+}
+function hunksInteract(a, b) {
+  const aEmpty = a.baseStart === a.baseEnd;
+  const bEmpty = b.baseStart === b.baseEnd;
+  if (aEmpty && bEmpty) return a.baseStart === b.baseStart;
+  if (aEmpty) return b.baseStart <= a.baseStart && a.baseStart <= b.baseEnd;
+  if (bEmpty) return a.baseStart <= b.baseStart && b.baseStart <= a.baseEnd;
+  return a.baseStart < b.baseEnd && b.baseStart < a.baseEnd;
+}
+function sideContent(base, side, hunks, lo, hi) {
+  const out = [];
+  let cursor = lo;
+  for (const h of hunks) {
+    if (h.baseStart > cursor) for (let k = cursor; k < h.baseStart; k++) out.push(base[k]);
+    for (let k = h.sideStart; k < h.sideEnd; k++) out.push(side[k]);
+    if (h.baseEnd > cursor) cursor = h.baseEnd;
+  }
+  for (let k = cursor; k < hi; k++) out.push(base[k]);
+  return out;
+}
+function mergeLines(base, ours, theirs, mo, mt) {
+  const out = [];
+  let tailSource = "base";
+  const emit = (lines, source) => {
+    if (lines.length === 0) return;
+    for (const l of lines) out.push(l);
+    tailSource = source;
+  };
+  const oursHunks = sideHunks(mo, ours);
+  const theirsHunks = sideHunks(mt, theirs);
+  const all = [
+    ...oursHunks.map((h) => ({ ...h, o: true })),
+    ...theirsHunks.map((h) => ({ ...h, o: false }))
+  ].sort((a, b) => a.baseStart - b.baseStart || a.baseEnd - b.baseEnd);
+  let prevHi = 0;
+  let lo = 0;
+  let hi = 0;
+  let group = [];
+  const flushRegion = () => {
+    if (group.length === 0) return true;
+    const oGroup = group.filter((h) => h.o);
+    const tGroup = group.filter((h) => !h.o);
+    const bChunk = base.slice(lo, hi);
+    const oChunk = sideContent(base, ours, oGroup, lo, hi);
+    const tChunk = sideContent(base, theirs, tGroup, lo, hi);
+    const oChanged = !listEquals(oChunk, bChunk);
+    const tChanged = !listEquals(tChunk, bChunk);
+    group = [];
+    if (!oChanged && !tChanged) emit(bChunk, "base");
+    else if (!oChanged) emit(tChunk, "theirs");
+    else if (!tChanged) emit(oChunk, "ours");
+    else if (listEquals(oChunk, tChunk)) emit(oChunk, "ours");
+    else return false;
+    return true;
+  };
+  const advance = (next) => {
+    if (group.length > 0) {
+      if (!flushRegion()) return false;
+      prevHi = hi;
+    }
+    if (next > prevHi) emit(base.slice(prevHi, next), "base");
+    prevHi = next;
+    return true;
+  };
+  for (const h of all) {
+    let touch = false;
+    if (group.length > 0) {
+      for (const r of group) {
+        if (hunksInteract(h, r)) {
+          touch = true;
+          break;
+        }
+      }
+    }
+    if (touch) {
+      lo = Math.min(lo, h.baseStart);
+      hi = Math.max(hi, h.baseEnd);
+      group.push(h);
+      continue;
+    }
+    if (!advance(h.baseStart)) return null;
+    lo = h.baseStart;
+    hi = h.baseEnd;
+    group.push(h);
+  }
+  if (!advance(base.length)) return null;
+  return { lines: out, tailSource };
+}
+function merge3(base, ours, theirs, opts = {}) {
+  var _a, _b, _c, _d;
+  const maxBytes = (_a = opts.maxBytes) != null ? _a : MERGE_MAX_BYTES;
+  if (base.length > maxBytes || ours.length > maxBytes || theirs.length > maxBytes) {
+    return { kind: "conflict", reason: "note is too large for auto-merge" };
+  }
+  if (ours === theirs) return { kind: "merged", text: ours };
+  if (base === ours) return { kind: "merged", text: theirs };
+  if (base === theirs) return { kind: "merged", text: ours };
+  const b = splitLines(base);
+  const o = splitLines(ours);
+  const t = splitLines(theirs);
+  const mo = matchMap(b.lines, o.lines, MAX_DIFF_D);
+  const mt = matchMap(b.lines, t.lines, MAX_DIFF_D);
+  if (!mo || !mt) {
+    return { kind: "conflict", reason: "versions are too divergent to auto-merge" };
+  }
+  const merged = mergeLines(b.lines, o.lines, t.lines, mo, mt);
+  if (!merged) {
+    return { kind: "conflict", reason: "both sides edited the same region" };
+  }
+  const dominant = (_d = (_c = (_b = o.eol) != null ? _b : t.eol) != null ? _c : b.eol) != null ? _d : "\n";
+  const trailing = merged.tailSource === "ours" ? o.trailingNewline : merged.tailSource === "theirs" ? t.trailingNewline : b.trailingNewline;
+  const text = merged.lines.length === 0 ? "" : merged.lines.join(dominant) + (trailing ? dominant : "");
+  return { kind: "merged", text };
+}
+
 // src/util.ts
 function errorMessage(error) {
   if (error instanceof Error && error.message) return error.message;
@@ -907,6 +1165,7 @@ var SyncEngine = class {
           pushed: 0,
           pulled: 0,
           conflicts: 0,
+          merged: 0,
           deletedLocal: 0,
           deletedRemote: 0,
           failures: []
@@ -918,6 +1177,11 @@ var SyncEngine = class {
       const remote = this.canonicalizeRemote((_b = indexResult.index.files) != null ? _b : {});
       const locals = this.collectLocalFiles();
       const journal = this.ctx.getJournal();
+      if (!settings.enableMarkdownAutoMerge) {
+        for (const record of Object.values(journal)) {
+          if ((record == null ? void 0 : record.basePlain) !== void 0) delete record.basePlain;
+        }
+      }
       const plan = planSync(locals, remote, journal, this.configDir);
       this.planLocals = locals;
       const deletes = plan.filter((op) => op.action === "delete-local");
@@ -934,11 +1198,12 @@ var SyncEngine = class {
         summary.failures.length === 0 ? "synced" : "error",
         summary.failures.length === 0 ? void 0 : `${summary.failures.length} file(s) failed`
       );
-      if (summary.conflicts > 0 || summary.failures.length > 0) {
+      if (summary.conflicts > 0 || summary.merged > 0 || summary.failures.length > 0) {
         const parts = [
           `${summary.pushed} pushed`,
           `${summary.pulled} pulled`,
           `${summary.conflicts} conflicts`,
+          ...summary.merged > 0 ? [`${summary.merged} auto-merged`] : [],
           `${summary.deletedLocal + summary.deletedRemote} deletions`
         ];
         this.ctx.notify(`E2EE Sync finished \u2014 ${parts.join(", ")}.`, 8e3);
@@ -1026,6 +1291,7 @@ var SyncEngine = class {
       pushed: 0,
       pulled: 0,
       conflicts: 0,
+      merged: 0,
       deletedLocal: 0,
       deletedRemote: 0,
       failures: []
@@ -1103,12 +1369,14 @@ var SyncEngine = class {
       file.stat.mtime,
       version
     );
-    this.ctx.setJournalEntry(op.path, {
+    const journalEntry = {
       localMtime: file.stat.mtime,
       remoteHash: uploaded.hash,
       remoteMtime: uploaded.mtime,
       remoteVersion: version
-    });
+    };
+    this.setMergeBase(op.path, journalEntry, plaintext);
+    this.ctx.setJournalEntry(op.path, journalEntry);
     this.markJournalDirty();
     summary.pushed++;
   }
@@ -1268,15 +1536,93 @@ var SyncEngine = class {
       throw error;
     }
     const written = this.ctx.app.vault.getAbstractFileByPath(targetPath);
-    this.ctx.setJournalEntry(targetPath, {
+    const journalEntry = {
       localMtime: written instanceof import_obsidian2.TFile ? written.stat.mtime : Date.now(),
       remoteHash: remote.hash,
       remoteMtime: remote.mtime,
       remoteVersion: packetVersion
-    });
+    };
+    this.setMergeBase(targetPath, journalEntry, plaintext);
+    this.ctx.setJournalEntry(targetPath, journalEntry);
     if (caseVariant) this.ctx.setJournalEntry(op.path, null);
     this.markJournalDirty();
     summary.pulled++;
+  }
+  // ------------------------------------------------- Markdown merge (IMP-1)
+  /** Is the opt-in three-way Markdown merge active for this cycle? */
+  mergeBaseEnabled() {
+    return this.ctx.getSettings().enableMarkdownAutoMerge === true;
+  }
+  /** Only .md notes up to the merge size cap are auto-merge candidates. */
+  isMergeCandidate(path, byteLength) {
+    return /\.md$/i.test(path) && byteLength <= MERGE_MAX_BYTES;
+  }
+  /**
+   * Record (or drop) the merge base on a fresh journal entry. The base is
+   * plaintext at rest in data.json — stored only while the toggle is on and
+   * only for eligible notes, purged otherwise.
+   */
+  setMergeBase(path, entry, plaintext) {
+    if (plaintext !== null && this.mergeBaseEnabled() && this.isMergeCandidate(path, plaintext.byteLength)) {
+      entry.basePlain = new TextDecoder().decode(plaintext);
+    } else {
+      delete entry.basePlain;
+    }
+  }
+  /**
+   * IMP-1: attempt a three-way merge of a conflicted Markdown note.
+   * base = the journal's stored copy, ours = the local file, theirs = the
+   * decrypted remote packet (integrity-checked like a pull). On a clean merge
+   * the result is written locally and pushed to the original path; any
+   * overlap returns false and the caller falls back to keep-both. Hard
+   * failures (network, crypto) propagate — the next cycle retries.
+   */
+  async tryMarkdownMerge(op, setup, summary, record) {
+    var _a, _b, _c;
+    if (!op.local || !op.remote || !(record == null ? void 0 : record.basePlain)) return false;
+    if (!this.isMergeCandidate(op.path, record.basePlain.length)) return false;
+    const local = this.ctx.app.vault.getAbstractFileByPath(op.local.path);
+    if (!(local instanceof import_obsidian2.TFile)) return false;
+    if (local.stat.size > MERGE_MAX_BYTES) return false;
+    const remote = op.remote;
+    let packet;
+    try {
+      packet = await setup.api.download((_a = op.remoteKey) != null ? _a : op.path);
+    } catch (e) {
+      return false;
+    }
+    if (await sha256Hex(new Uint8Array(packet)) !== remote.hash) return false;
+    const manifest = remote.manifest && remote.manifest.length === 64 ? remote.manifest : null;
+    const theirs = manifest ? (await setup.crypto.decryptChunked(packet, op.path, hexToBytes(manifest))).plaintext : (await setup.crypto.decrypt(packet, op.path)).plaintext;
+    const ours = await this.ctx.app.vault.readBinary(local);
+    const decoder = new TextDecoder();
+    const result = merge3(record.basePlain, decoder.decode(ours), decoder.decode(theirs));
+    if (result.kind !== "merged") return false;
+    const mergedBytes = new TextEncoder().encode(result.text);
+    const mergedBuffer = mergedBytes.buffer;
+    this.beginIgnore(op.path);
+    try {
+      await this.ctx.app.vault.modifyBinary(local, mergedBuffer);
+    } catch (error) {
+      this.ignorePaths.delete(op.path);
+      throw error;
+    }
+    const written = this.ctx.app.vault.getAbstractFileByPath(op.path);
+    const mtime = written instanceof import_obsidian2.TFile ? written.stat.mtime : local.stat.mtime;
+    const version = Math.max((_b = record.remoteVersion) != null ? _b : 0, (_c = remote.ver) != null ? _c : 0) + 1;
+    const uploaded = await this.encryptAndUpload(setup, op.path, mergedBuffer, mtime, version);
+    const journalEntry = {
+      localMtime: mtime,
+      remoteHash: uploaded.hash,
+      remoteMtime: uploaded.mtime,
+      remoteVersion: version
+    };
+    this.setMergeBase(op.path, journalEntry, mergedBuffer);
+    this.ctx.setJournalEntry(op.path, journalEntry);
+    this.markJournalDirty();
+    summary.merged++;
+    this.ctx.notify(`Conflict in ${op.path} resolved by Markdown auto-merge.`, 6e3);
+    return true;
   }
   /**
    * "Keep both" conflict resolution — ordered so a failure never leaves
@@ -1284,15 +1630,21 @@ var SyncEngine = class {
    *  1. upload the local version to <name>_conflict_<timestamp>.<ext> FIRST,
    *  2. only then create the local copy of it and journal it,
    *  3. download the remote version into the original path.
+   * When the Markdown auto-merge (IMP-1) is enabled and produces a clean
+   * three-way merge, the conflict resolves without any duplicate copy.
    */
   async doConflict(op, setup, summary) {
     var _a;
     if (!op.local) return;
     const local = this.ctx.app.vault.getAbstractFileByPath(op.local.path);
     if (!(local instanceof import_obsidian2.TFile)) return;
+    const record = this.ctx.getJournal()[op.path];
+    if (this.mergeBaseEnabled()) {
+      const merged = await this.tryMarkdownMerge(op, setup, summary, record);
+      if (merged) return;
+    }
     const conflictPath = this.uniqueConflictPath(op.path);
     const localCopy = await this.ctx.app.vault.readBinary(local);
-    const record = this.ctx.getJournal()[op.path];
     const version = ((_a = record == null ? void 0 : record.remoteVersion) != null ? _a : 0) + 1;
     const uploaded = await this.encryptAndUpload(
       setup,
@@ -1309,12 +1661,14 @@ var SyncEngine = class {
       throw error;
     }
     const written = this.ctx.app.vault.getAbstractFileByPath(conflictPath);
-    this.ctx.setJournalEntry(conflictPath, {
+    const conflictEntry = {
       localMtime: written instanceof import_obsidian2.TFile ? written.stat.mtime : local.stat.mtime,
       remoteHash: uploaded.hash,
       remoteMtime: uploaded.mtime,
       remoteVersion: version
-    });
+    };
+    this.setMergeBase(conflictPath, conflictEntry, null);
+    this.ctx.setJournalEntry(conflictPath, conflictEntry);
     this.markJournalDirty();
     await this.doPull({ ...op, local: void 0, remoteKey: op.remoteKey }, setup, summary);
     summary.conflicts++;
@@ -1450,12 +1804,14 @@ Both versions kept \u2014 local copy saved as: ${conflictPath}`,
         const record = this.ctx.getJournal()[path];
         const version = ((_a2 = record == null ? void 0 : record.remoteVersion) != null ? _a2 : 0) + 1;
         const uploaded = await this.encryptAndUpload(setup, path, plaintext, file.stat.mtime, version);
-        this.ctx.setJournalEntry(path, {
+        const repairEntry = {
           localMtime: file.stat.mtime,
           remoteHash: uploaded.hash,
           remoteMtime: uploaded.mtime,
           remoteVersion: version
-        });
+        };
+        this.setMergeBase(path, repairEntry, plaintext);
+        this.ctx.setJournalEntry(path, repairEntry);
         this.markJournalDirty();
         repaired.push(path);
       } catch (e) {
@@ -1556,12 +1912,14 @@ Both versions kept \u2014 local copy saved as: ${conflictPath}`,
         const record = this.ctx.getJournal()[path];
         const version = Math.max((_a = record == null ? void 0 : record.remoteVersion) != null ? _a : 0, (_b = entry.ver) != null ? _b : 0) + 1;
         const uploaded = await this.encryptAndUpload(newSetup, path, plaintext, Date.now(), version);
-        this.ctx.setJournalEntry(path, {
+        const rotationEntry = {
           localMtime: (_c = record == null ? void 0 : record.localMtime) != null ? _c : Date.now(),
           remoteHash: uploaded.hash,
           remoteMtime: uploaded.mtime,
           remoteVersion: version
-        });
+        };
+        this.setMergeBase(path, rotationEntry, plaintext);
+        this.ctx.setJournalEntry(path, rotationEntry);
         this.markJournalDirty();
         done++;
         if (done % 10 === 0 || done === remoteFiles.length) {
@@ -1603,7 +1961,7 @@ Both versions kept \u2014 local copy saved as: ${conflictPath}`,
   ensureApi(settings) {
     const signature = `${settings.serverUrl}\0${settings.apiToken}`;
     if (!this.api || this.apiSignature !== signature) {
-      this.api = new SyncApi(settings.serverUrl, settings.apiToken);
+      this.api = this.ctx.createApi ? this.ctx.createApi(settings.serverUrl, settings.apiToken) : new SyncApi(settings.serverUrl, settings.apiToken);
       this.apiSignature = signature;
     }
     return this.api;

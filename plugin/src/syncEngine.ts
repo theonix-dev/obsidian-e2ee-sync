@@ -62,6 +62,7 @@ import {
   toHex,
 } from './crypto';
 import type { PluginSettings, RemoteFileInfo, RemoteIndex, SyncRecord, SyncStatus } from './types';
+import { MERGE_MAX_BYTES, merge3 } from './merge';
 import { errorMessage } from './util';
 
 /** Per-file debounce window for local vault events (ms). */
@@ -147,6 +148,8 @@ export interface SyncSummary {
   pushed: number;
   pulled: number;
   conflicts: number;
+  /** IMP-1: conflicts resolved by the opt-in Markdown three-way merge. */
+  merged: number;
   deletedLocal: number;
   deletedRemote: number;
   failures: Array<{ path: string; error: string }>;
@@ -490,7 +493,7 @@ export class SyncEngine {
       if (indexResult.notModified) {
         this.ctx.setStatus('synced');
         return {
-          pushed: 0, pulled: 0, conflicts: 0,
+          pushed: 0, pulled: 0, conflicts: 0, merged: 0,
           deletedLocal: 0, deletedRemote: 0, failures: [],
         };
       }
@@ -502,6 +505,14 @@ export class SyncEngine {
       const remote = this.canonicalizeRemote(indexResult.index.files ?? {});
       const locals = this.collectLocalFiles();
       const journal = this.ctx.getJournal();
+
+      // IMP-1 hygiene: with the toggle off no merge base may stay at rest in
+      // data.json — purge every stored plaintext copy.
+      if (!settings.enableMarkdownAutoMerge) {
+        for (const record of Object.values(journal)) {
+          if (record?.basePlain !== undefined) delete record.basePlain;
+        }
+      }
 
       const plan: PlannedOp[] = planSync(locals, remote, journal, this.configDir);
       this.planLocals = locals;
@@ -529,11 +540,12 @@ export class SyncEngine {
       this.ctx.setStatus(summary.failures.length === 0 ? 'synced' : 'error',
         summary.failures.length === 0 ? undefined : `${summary.failures.length} file(s) failed`);
 
-      if (summary.conflicts > 0 || summary.failures.length > 0) {
+      if (summary.conflicts > 0 || summary.merged > 0 || summary.failures.length > 0) {
         const parts = [
           `${summary.pushed} pushed`,
           `${summary.pulled} pulled`,
           `${summary.conflicts} conflicts`,
+          ...(summary.merged > 0 ? [`${summary.merged} auto-merged`] : []),
           `${summary.deletedLocal + summary.deletedRemote} deletions`,
         ];
         this.ctx.notify(`E2EE Sync finished — ${parts.join(', ')}.`, 8000);
@@ -631,6 +643,7 @@ export class SyncEngine {
       pushed: 0,
       pulled: 0,
       conflicts: 0,
+      merged: 0,
       deletedLocal: 0,
       deletedRemote: 0,
       failures: [],
@@ -714,12 +727,16 @@ export class SyncEngine {
       setup, op.path, plaintext, file.stat.mtime, version,
     );
 
-    this.ctx.setJournalEntry(op.path, {
+    const journalEntry: SyncRecord = {
       localMtime: file.stat.mtime,
       remoteHash: uploaded.hash,
       remoteMtime: uploaded.mtime,
       remoteVersion: version,
-    });
+    };
+    // After a successful push local == remote, so the pushed content is the
+    // next merge base (IMP-1; only stored when the toggle is on).
+    this.setMergeBase(op.path, journalEntry, plaintext);
+    this.ctx.setJournalEntry(op.path, journalEntry);
     this.markJournalDirty();
     summary.pushed++;
   }
@@ -927,15 +944,116 @@ export class SyncEngine {
     // exact value, otherwise the next cycle would mistake our own pull for a
     // local modification and push it right back.
     const written = this.ctx.app.vault.getAbstractFileByPath(targetPath);
-    this.ctx.setJournalEntry(targetPath, {
+    const journalEntry: SyncRecord = {
       localMtime: written instanceof TFile ? written.stat.mtime : Date.now(),
       remoteHash: remote.hash,
       remoteMtime: remote.mtime,
       remoteVersion: packetVersion,
-    });
+    };
+    // The pulled copy is the next merge base (IMP-1).
+    this.setMergeBase(targetPath, journalEntry, plaintext);
+    this.ctx.setJournalEntry(targetPath, journalEntry);
     if (caseVariant) this.ctx.setJournalEntry(op.path, null);
     this.markJournalDirty();
     summary.pulled++;
+  }
+
+  // ------------------------------------------------- Markdown merge (IMP-1)
+
+  /** Is the opt-in three-way Markdown merge active for this cycle? */
+  private mergeBaseEnabled(): boolean {
+    return this.ctx.getSettings().enableMarkdownAutoMerge === true;
+  }
+
+  /** Only .md notes up to the merge size cap are auto-merge candidates. */
+  private isMergeCandidate(path: string, byteLength: number): boolean {
+    return /\.md$/i.test(path) && byteLength <= MERGE_MAX_BYTES;
+  }
+
+  /**
+   * Record (or drop) the merge base on a fresh journal entry. The base is
+   * plaintext at rest in data.json — stored only while the toggle is on and
+   * only for eligible notes, purged otherwise.
+   */
+  private setMergeBase(path: string, entry: SyncRecord, plaintext: ArrayBuffer | null): void {
+    if (plaintext !== null && this.mergeBaseEnabled() && this.isMergeCandidate(path, plaintext.byteLength)) {
+      entry.basePlain = new TextDecoder().decode(plaintext);
+    } else {
+      delete entry.basePlain;
+    }
+  }
+
+  /**
+   * IMP-1: attempt a three-way merge of a conflicted Markdown note.
+   * base = the journal's stored copy, ours = the local file, theirs = the
+   * decrypted remote packet (integrity-checked like a pull). On a clean merge
+   * the result is written locally and pushed to the original path; any
+   * overlap returns false and the caller falls back to keep-both. Hard
+   * failures (network, crypto) propagate — the next cycle retries.
+   */
+  private async tryMarkdownMerge(
+    op: PlannedOp,
+    setup: SyncSetup,
+    summary: SyncSummary,
+    record: SyncRecord | undefined,
+  ): Promise<boolean> {
+    if (!op.local || !op.remote || !record?.basePlain) return false;
+    if (!this.isMergeCandidate(op.path, record.basePlain.length)) return false;
+
+    const local = this.ctx.app.vault.getAbstractFileByPath(op.local.path);
+    if (!(local instanceof TFile)) return false;
+    if (local.stat.size > MERGE_MAX_BYTES) return false;
+
+    // theirs: download + verify + decrypt exactly like doPull would.
+    const remote = op.remote;
+    let packet: ArrayBuffer;
+    try {
+      packet = await setup.api.download(op.remoteKey ?? op.path);
+    } catch {
+      return false; // remote vanished mid-sync — keep-both flow re-checks
+    }
+    if ((await sha256Hex(new Uint8Array(packet))) !== remote.hash) return false;
+    const manifest = remote.manifest && remote.manifest.length === 64 ? remote.manifest : null;
+    const theirs = manifest
+      ? (await setup.crypto.decryptChunked(packet, op.path, hexToBytes(manifest))).plaintext
+      : (await setup.crypto.decrypt(packet, op.path)).plaintext;
+
+    const ours = await this.ctx.app.vault.readBinary(local);
+    const decoder = new TextDecoder();
+    const result = merge3(record.basePlain, decoder.decode(ours), decoder.decode(theirs));
+    if (result.kind !== 'merged') return false;
+
+    // 1. Write the merged note locally (our own write must not re-trigger sync).
+    const mergedBytes = new TextEncoder().encode(result.text);
+    const mergedBuffer = mergedBytes.buffer as ArrayBuffer;
+    this.beginIgnore(op.path);
+    try {
+      await this.ctx.app.vault.modifyBinary(local, mergedBuffer);
+    } catch (error) {
+      this.ignorePaths.delete(op.path);
+      throw error;
+    }
+
+    // 2. Push the merged content to the original path. A failure here leaves
+    //    the merged local file unjournaled — the next cycle plans a push and
+    //    converges (no data can be lost: theirs is untouched on the server).
+    const written = this.ctx.app.vault.getAbstractFileByPath(op.path);
+    const mtime = written instanceof TFile ? written.stat.mtime : local.stat.mtime;
+    const version = Math.max(record.remoteVersion ?? 0, remote.ver ?? 0) + 1;
+    const uploaded = await this.encryptAndUpload(setup, op.path, mergedBuffer, mtime, version);
+    const journalEntry: SyncRecord = {
+      localMtime: mtime,
+      remoteHash: uploaded.hash,
+      remoteMtime: uploaded.mtime,
+      remoteVersion: version,
+    };
+    this.setMergeBase(op.path, journalEntry, mergedBuffer);
+    this.ctx.setJournalEntry(op.path, journalEntry);
+    this.markJournalDirty();
+
+    summary.merged++;
+    this.ctx.notify(`Conflict in ${op.path} resolved by Markdown auto-merge.`, 6000);
+    return true;
   }
 
   /**
@@ -944,15 +1062,22 @@ export class SyncEngine {
    *  1. upload the local version to <name>_conflict_<timestamp>.<ext> FIRST,
    *  2. only then create the local copy of it and journal it,
    *  3. download the remote version into the original path.
+   * When the Markdown auto-merge (IMP-1) is enabled and produces a clean
+   * three-way merge, the conflict resolves without any duplicate copy.
    */
   private async doConflict(op: PlannedOp, setup: SyncSetup, summary: SyncSummary): Promise<void> {
     if (!op.local) return;
     const local = this.ctx.app.vault.getAbstractFileByPath(op.local.path);
     if (!(local instanceof TFile)) return; // vanished mid-sync; next cycle retries
 
+    const record = this.ctx.getJournal()[op.path];
+    if (this.mergeBaseEnabled()) {
+      const merged = await this.tryMarkdownMerge(op, setup, summary, record);
+      if (merged) return;
+    }
+
     const conflictPath = this.uniqueConflictPath(op.path);
     const localCopy = await this.ctx.app.vault.readBinary(local);
-    const record = this.ctx.getJournal()[op.path];
     const version = (record?.remoteVersion ?? 0) + 1;
 
     // 1. Preserve the local version remotely first — a network failure here
@@ -970,12 +1095,15 @@ export class SyncEngine {
       throw error;
     }
     const written = this.ctx.app.vault.getAbstractFileByPath(conflictPath);
-    this.ctx.setJournalEntry(conflictPath, {
+    const conflictEntry: SyncRecord = {
       localMtime: written instanceof TFile ? written.stat.mtime : local.stat.mtime,
       remoteHash: uploaded.hash,
       remoteMtime: uploaded.mtime,
       remoteVersion: version,
-    });
+    };
+    // A fresh conflict copy has no common ancestor yet — no merge base.
+    this.setMergeBase(conflictPath, conflictEntry, null);
+    this.ctx.setJournalEntry(conflictPath, conflictEntry);
     this.markJournalDirty();
 
     // 3. Remote wins the original path.
@@ -1133,12 +1261,14 @@ export class SyncEngine {
         const record = this.ctx.getJournal()[path];
         const version = (record?.remoteVersion ?? 0) + 1;
         const uploaded = await this.encryptAndUpload(setup, path, plaintext, file.stat.mtime, version);
-        this.ctx.setJournalEntry(path, {
+        const repairEntry: SyncRecord = {
           localMtime: file.stat.mtime,
           remoteHash: uploaded.hash,
           remoteMtime: uploaded.mtime,
           remoteVersion: version,
-        });
+        };
+        this.setMergeBase(path, repairEntry, plaintext);
+        this.ctx.setJournalEntry(path, repairEntry);
         this.markJournalDirty();
         repaired.push(path);
       } catch {
@@ -1248,12 +1378,14 @@ export class SyncEngine {
         const record = this.ctx.getJournal()[path];
         const version = Math.max(record?.remoteVersion ?? 0, entry.ver ?? 0) + 1;
         const uploaded = await this.encryptAndUpload(newSetup, path, plaintext, Date.now(), version);
-        this.ctx.setJournalEntry(path, {
+        const rotationEntry: SyncRecord = {
           localMtime: record?.localMtime ?? Date.now(),
           remoteHash: uploaded.hash,
           remoteMtime: uploaded.mtime,
           remoteVersion: version,
-        });
+        };
+        this.setMergeBase(path, rotationEntry, plaintext);
+        this.ctx.setJournalEntry(path, rotationEntry);
         this.markJournalDirty();
         done++;
         if (done % 10 === 0 || done === remoteFiles.length) {

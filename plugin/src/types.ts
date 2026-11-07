@@ -45,6 +45,13 @@ export interface SyncRecord {
    * refused. 0 = never seen a v3 packet for this path.
    */
   remoteVersion: number;
+  /**
+   * IMP-1 (opt-in Markdown auto-merge): plaintext of the last synced copy of
+   * this .md note — the merge base for three-way conflict resolution. Stored
+   * ONLY while enableMarkdownAutoMerge is on (plaintext at rest in data.json);
+   * purged from every record when the toggle is off.
+   */
+  basePlain?: string;
 }
 
 export type SyncStatus = 'idle' | 'syncing' | 'synced' | 'error' | 'offline';

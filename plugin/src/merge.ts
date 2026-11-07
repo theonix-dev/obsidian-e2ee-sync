@@ -183,7 +183,10 @@ function sideHunks(matches: Int32Array, side: string[]): Hunk[] {
   // Insertions in gaps between consecutive matched lines. A gap before the
   // FIRST matched line is not an insertion when base lines 0..i-1 are
   // unmatched — the leading run's replacement already spans those side lines.
+  // Likewise a side gap behind an unmatched run of base lines belongs to that
+  // run's replacement, so insertions only apply between base-ADJACENT matches.
   let prevMatch = -1;
+  let lastMatchedBase = -1;
   for (let i = 0; i < n; i++) {
     const m = matches[i];
     if (m === -1) continue;
@@ -191,10 +194,11 @@ function sideHunks(matches: Int32Array, side: string[]): Hunk[] {
       if (m > 0) {
         hunks.push({ baseStart: 0, baseEnd: 0, sideStart: 0, sideEnd: m });
       }
-    } else if (prevMatch >= 0 && m - prevMatch > 1) {
+    } else if (i - lastMatchedBase === 1 && prevMatch >= 0 && m - prevMatch > 1) {
       hunks.push({ baseStart: i, baseEnd: i, sideStart: prevMatch + 1, sideEnd: m });
     }
     prevMatch = m;
+    lastMatchedBase = i;
   }
   // Trailing insertion — only when the last base line is matched (otherwise
   // the trailing run below already carries the extra side lines).

@@ -310,6 +310,84 @@ async function run() {
     equal(server.files.get('note.md')?.entry.ver, 2, 'remote stays at v2');
   }
 
+  console.log('[3] IMP-1: clean Markdown auto-merge resolves the conflict');
+  {
+    const server = new FakeServer(cryptoMod);
+    const a = makeDevice('A', new FakeVault(), server, { autoMerge: true });
+    const b = makeDevice('B', new FakeVault(), server, { autoMerge: true });
+
+    const note = 'intro line\n\npara-A\n\npara-B\n\noutro\n';
+    await a.vault.createBinary('note.md', utf8(note));
+    await sync(a, 'A initial');
+    await sync(b, 'B initial pull (stores merge base)');
+
+    ok(
+      typeof b.journal['note.md']?.basePlain === 'string' && b.journal['note.md'].basePlain === note,
+      'toggle on: journal stores the pulled plaintext as merge base',
+    );
+
+    // A edits the intro; B edits para-B — different regions.
+    await a.vault.modifyBinary(a.vault.getAbstractFileByPath('note.md'), utf8(note.replace('intro line', 'intro line (A)')));
+    await sync(a, 'A push');
+    await b.vault.modifyBinary(b.vault.getAbstractFileByPath('note.md'), utf8(note.replace('para-B', 'para-B (B)')));
+    const summary = await sync(b, 'B conflict cycle with merge');
+
+    equal(summary?.merged, 1, 'conflict resolved by auto-merge');
+    equal(summary?.conflicts, 0, 'no keep-both duplication');
+    equal(await text(b, 'note.md'), 'intro line (A)\n\npara-A\n\npara-B (B)\n\noutro\n',
+      'local file holds the merged note');
+    equal(b.vault.getFiles().filter((f) => f.path.includes('_conflict_')).length, 0,
+      'no conflict copy was created');
+    equal(server.files.get('note.md')?.entry.ver, 3, 'merged content pushed as v3');
+
+    // Device A converges to the merged version on its next cycle.
+    await sync(a, 'A pull merged');
+    equal(await text(a, 'note.md'), 'intro line (A)\n\npara-A\n\npara-B (B)\n\noutro\n',
+      'A receives the merged note');
+  }
+
+  console.log('[4] IMP-1: overlapping edits fall back to keep-both even with the toggle on');
+  {
+    const server = new FakeServer(cryptoMod);
+    const a = makeDevice('A', new FakeVault(), server, { autoMerge: true });
+    const b = makeDevice('B', new FakeVault(), server, { autoMerge: true });
+
+    await a.vault.createBinary('note.md', utf8('line1\nline2\nline3\n'));
+    await sync(a, 'A initial');
+    await sync(b, 'B initial pull');
+
+    await a.vault.modifyBinary(a.vault.getAbstractFileByPath('note.md'), utf8('line1\nA-edits line2\nline3\n'));
+    await sync(a, 'A push');
+    await b.vault.modifyBinary(b.vault.getAbstractFileByPath('note.md'), utf8('line1\nB-edits line2\nline3\n'));
+    const summary = await sync(b, 'B conflict cycle');
+
+    equal(summary?.merged, 0, 'no auto-merge for overlapping edits');
+    equal(summary?.conflicts, 1, 'keep-both applied');
+    equal(b.vault.getFiles().filter((f) => f.path.includes('_conflict_')).length, 1,
+      'conflict copy exists');
+  }
+
+  console.log('[5] IMP-1: base hygiene — only eligible .md notes, purged when off');
+  {
+    const server = new FakeServer(cryptoMod);
+    const on = makeDevice('A', new FakeVault(), server, { autoMerge: true });
+    const off = makeDevice('B', new FakeVault(), server, { autoMerge: false });
+
+    await on.vault.createBinary('note.md', utf8('md content\n'));
+    await on.vault.createBinary('data.txt', utf8('txt content\n'));
+    await sync(on, 'A push both');
+    ok(typeof on.journal['note.md']?.basePlain === 'string', 'toggle on: .md gets a base');
+    ok(on.journal['data.txt']?.basePlain === undefined, 'non-.md never gets a base');
+
+    await sync(off, 'B pull');
+    ok(off.journal['note.md']?.basePlain === undefined, 'toggle off: no base stored');
+
+    // Turning the toggle off purges stored bases on the next cycle.
+    on.settings.enableMarkdownAutoMerge = false;
+    await sync(on, 'A idle cycle with toggle off');
+    ok(on.journal['note.md']?.basePlain === undefined, 'bases purged after the toggle goes off');
+  }
+
   finish('engine.spec');
 }
 
