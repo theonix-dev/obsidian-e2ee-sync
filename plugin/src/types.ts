@@ -58,6 +58,13 @@ export interface SyncRecord {
    * deletes; the server entry is left untouched.
    */
   ignored?: boolean;
+  /**
+   * IMP-7: plaintext chunk hashes (hex) of the last content-defined-chunking
+   * upload of this file — the delta-planning primitive. Capped at 2048
+   * chunks (~128 MiB at the 64 KiB average) to bound journal size; absent
+   * for single-shot uploads and over-cap files.
+   */
+  baseChunkHashes?: string[];
 }
 
 export type SyncStatus = 'idle' | 'syncing' | 'synced' | 'error' | 'offline';

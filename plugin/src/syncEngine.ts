@@ -62,6 +62,7 @@ import {
   toHex,
 } from './crypto';
 import type { ConfigSyncSettings, PluginSettings, RemoteFileInfo, RemoteIndex, SyncRecord, SyncStatus } from './types';
+import { cdcChunkSlices } from './cdc';
 import { ignoreMatcherFromSources } from './ignore';
 import type { IgnoreMatcher } from './ignore';
 import { MERGE_MAX_BYTES, merge3 } from './merge';
@@ -112,6 +113,10 @@ const CHUNKED_ABOVE_BYTES = 16 * 1024 * 1024;
 const CHUNK_PLAINTEXT_BYTES = 8 * 1024 * 1024;
 /** Per-chunk network retries (network-level failures only), with backoff. */
 const CHUNK_RETRIES = 2;
+/** Server-side staging cap (server.js: chunkCount <= 100000). */
+const MAX_STAGING_CHUNKS = 100_000;
+/** IMP-7: journal bound for stored chunk hashes (~128 KiB per record). */
+const MAX_BASE_CHUNK_HASHES = 2048;
 
 /** Vault folders that must never round-trip to the server. */
 const EXCLUDED_PREFIXES = ['.trash/'];
@@ -237,6 +242,14 @@ interface SyncSetup {
   crypto: CryptoManager;
   salt: Uint8Array;
   keyIdHex: string;
+}
+
+/** Result of one upload: the server's index entry plus (chunked uploads only)
+ *  the plaintext chunk hashes the file manifest was built from (IMP-7). */
+interface UploadResult {
+  entry: RemoteFileInfo;
+  /** Hex SHA-256 of every plaintext chunk; null for single-shot uploads. */
+  chunkHashes: string[] | null;
 }
 
 export interface EngineContext {
@@ -1022,13 +1035,14 @@ export class SyncEngine {
 
     const journalEntry: SyncRecord = {
       localMtime: file.stat.mtime,
-      remoteHash: uploaded.hash,
-      remoteMtime: uploaded.mtime,
+      remoteHash: uploaded.entry.hash,
+      remoteMtime: uploaded.entry.mtime,
       remoteVersion: version,
     };
     // After a successful push local == remote, so the pushed content is the
     // next merge base (IMP-1; only stored when the toggle is on).
     this.setMergeBase(op.path, journalEntry, plaintext);
+    this.setBaseChunkHashes(journalEntry, uploaded.chunkHashes);
     this.putRecord(op.path, journalEntry);
     this.markJournalDirty();
     summary.pushed++;
@@ -1037,7 +1051,9 @@ export class SyncEngine {
   /**
    * Encrypt `plaintext` for `path` under the setup's key at `version` and
    * upload it — single-shot for small files, chunked and resumable above
-   * CHUNKED_ABOVE_BYTES (PROB-3). Returns the server's index entry.
+   * CHUNKED_ABOVE_BYTES (PROB-3). Large files are cut by content-defined
+   * boundaries (IMP-7); the chunked result carries the plaintext chunk hashes
+   * for the journal's delta planning.
    */
   private async encryptAndUpload(
     setup: SyncSetup,
@@ -1045,26 +1061,36 @@ export class SyncEngine {
     plaintext: ArrayBuffer,
     clientMtime: number,
     version: number,
-  ): Promise<RemoteFileInfo> {
+  ): Promise<UploadResult> {
     const bytes = new Uint8Array(plaintext);
     if (plaintext.byteLength <= CHUNKED_ABOVE_BYTES) {
       const packet = await setup.crypto.encrypt(plaintext, setup.salt, path, version);
-      return setup.api.upload(path, packet, clientMtime, await sha256Hex(new Uint8Array(packet)), {
-        keyId: setup.keyIdHex,
-        fileVersion: version,
-      });
+      const entry = await setup.api.upload(
+        path, packet, clientMtime, await sha256Hex(new Uint8Array(packet)), {
+          keyId: setup.keyIdHex,
+          fileVersion: version,
+        },
+      );
+      return { entry, chunkHashes: null };
     }
 
-    // ---- chunked path: one v3 packet per 8 MiB plaintext slice, all bound
-    // to a single file manifest (SHA-256 over the plaintext chunk hashes).
-    const slices: Array<[number, number]> = [];
-    for (let o = 0; o < bytes.length; o += CHUNK_PLAINTEXT_BYTES) {
-      slices.push([o, Math.min(o + CHUNK_PLAINTEXT_BYTES, bytes.length)]);
+    // ---- chunked path: one v3 packet per content-defined plaintext slice
+    // (IMP-7, ~64 KiB average), all bound to a single file manifest
+    // (SHA-256 over the plaintext chunk hashes). Fixed 8 MiB cuts remain as
+    // the fallback when CDC would exceed the server's chunk-count cap.
+    let slices = cdcChunkSlices(bytes);
+    if (slices.length > MAX_STAGING_CHUNKS) {
+      slices = [];
+      for (let o = 0; o < bytes.length; o += CHUNK_PLAINTEXT_BYTES) {
+        slices.push([o, Math.min(o + CHUNK_PLAINTEXT_BYTES, bytes.length)]);
+      }
     }
+    const chunkHashes: string[] = new Array(slices.length);
     let manifestInput = new Uint8Array(slices.length * 32);
     for (let i = 0; i < slices.length; i++) {
       const [o, end] = slices[i];
       const h = await sha256Bytes(bytes.subarray(o, end));
+      chunkHashes[i] = toHex(h);
       manifestInput.set(h, i * 32);
     }
     const fileManifest = await sha256Bytes(manifestInput);
@@ -1093,11 +1119,12 @@ export class SyncEngine {
       this.emitProgress({ index: i + 1, count: slices.length });
     }
 
-    return setup.api.commitUpload(uploadId, {
+    const entry = await setup.api.commitUpload(uploadId, {
       clientMtime,
       keyId: setup.keyIdHex,
       fileVersion: version,
     });
+    return { entry, chunkHashes };
   }
 
   /** PUT one chunk with bounded retries (network errors) and status-based resume. */
@@ -1271,6 +1298,18 @@ export class SyncEngine {
   }
 
   /**
+   * IMP-7: store (or drop) the plaintext chunk hashes of the last upload —
+   * the delta-planning baseline. Capped to bound data.json growth.
+   */
+  private setBaseChunkHashes(entry: SyncRecord, chunkHashes: string[] | null): void {
+    if (chunkHashes && chunkHashes.length > 0 && chunkHashes.length <= MAX_BASE_CHUNK_HASHES) {
+      entry.baseChunkHashes = chunkHashes;
+    } else {
+      delete entry.baseChunkHashes;
+    }
+  }
+
+  /**
    * Record (or drop) the merge base on a fresh journal entry. The base is
    * plaintext at rest in data.json — stored only while the toggle is on and
    * only for eligible notes, purged otherwise.
@@ -1344,11 +1383,12 @@ export class SyncEngine {
     const uploaded = await this.encryptAndUpload(setup, op.path, mergedBuffer, mtime, version);
     const journalEntry: SyncRecord = {
       localMtime: mtime,
-      remoteHash: uploaded.hash,
-      remoteMtime: uploaded.mtime,
+      remoteHash: uploaded.entry.hash,
+      remoteMtime: uploaded.entry.mtime,
       remoteVersion: version,
     };
     this.setMergeBase(op.path, journalEntry, mergedBuffer);
+    this.setBaseChunkHashes(journalEntry, uploaded.chunkHashes);
     this.putRecord(op.path, journalEntry);
     this.markJournalDirty();
 
@@ -1396,11 +1436,12 @@ export class SyncEngine {
     );
     const entry: SyncRecord = {
       localMtime: local.stat.mtime,
-      remoteHash: uploaded.hash,
-      remoteMtime: uploaded.mtime,
+      remoteHash: uploaded.entry.hash,
+      remoteMtime: uploaded.entry.mtime,
       remoteVersion: version,
     };
     this.setMergeBase(op.path, entry, plaintext);
+    this.setBaseChunkHashes(entry, uploaded.chunkHashes);
     this.putRecord(op.path, entry);
     this.markJournalDirty();
     summary.pushed++;
@@ -1473,12 +1514,14 @@ export class SyncEngine {
     const written = this.ctx.app.vault.getAbstractFileByPath(conflictLocal);
     const conflictEntry: SyncRecord = {
       localMtime: written instanceof TFile ? written.stat.mtime : local.stat.mtime,
-      remoteHash: uploaded.hash,
-      remoteMtime: uploaded.mtime,
+      remoteHash: uploaded.entry.hash,
+      remoteMtime: uploaded.entry.mtime,
       remoteVersion: version,
     };
-    // A fresh conflict copy has no common ancestor yet — no merge base.
+    // A fresh conflict copy has no common ancestor yet — no merge base and
+    // no delta baseline.
     this.setMergeBase(conflictPath, conflictEntry, null);
+    this.setBaseChunkHashes(conflictEntry, uploaded.chunkHashes);
     this.putRecord(conflictPath, conflictEntry);
     this.markJournalDirty();
 
@@ -1723,11 +1766,12 @@ export class SyncEngine {
         const uploaded = await this.encryptAndUpload(setup, path, plaintext, file.stat.mtime, version);
         const repairEntry: SyncRecord = {
           localMtime: file.stat.mtime,
-          remoteHash: uploaded.hash,
-          remoteMtime: uploaded.mtime,
+          remoteHash: uploaded.entry.hash,
+          remoteMtime: uploaded.entry.mtime,
           remoteVersion: version,
         };
         this.setMergeBase(path, repairEntry, plaintext);
+        this.setBaseChunkHashes(repairEntry, uploaded.chunkHashes);
         this.putRecord(path, repairEntry);
         this.markJournalDirty();
         repaired.push(path);
@@ -1840,11 +1884,12 @@ export class SyncEngine {
         const uploaded = await this.encryptAndUpload(newSetup, path, plaintext, Date.now(), version);
         const rotationEntry: SyncRecord = {
           localMtime: record?.localMtime ?? Date.now(),
-          remoteHash: uploaded.hash,
-          remoteMtime: uploaded.mtime,
+          remoteHash: uploaded.entry.hash,
+          remoteMtime: uploaded.entry.mtime,
           remoteVersion: version,
         };
         this.setMergeBase(path, rotationEntry, plaintext);
+        this.setBaseChunkHashes(rotationEntry, uploaded.chunkHashes);
         this.putRecord(path, rotationEntry);
         this.markJournalDirty();
         done++;

@@ -641,6 +641,46 @@ var CryptoManager = class {
   }
 };
 
+// src/cdc.ts
+var CDC_MIN_BYTES = 16 * 1024;
+var CDC_AVG_BYTES = 64 * 1024;
+var CDC_MAX_BYTES = 1024 * 1024;
+var GEAR = new Int32Array(256);
+(function initGear() {
+  let x = 2654435769 | 0;
+  for (let i = 0; i < 256; i++) {
+    x = Math.imul(x, 1664525) + 1013904223 | 0;
+    GEAR[i] = x;
+  }
+})();
+function cdcChunkSlices(bytes, opts = {}) {
+  var _a, _b, _c;
+  const min = Math.max(1, (_a = opts.min) != null ? _a : CDC_MIN_BYTES);
+  const average = (_b = opts.average) != null ? _b : CDC_AVG_BYTES;
+  const max = Math.max(min, (_c = opts.max) != null ? _c : CDC_MAX_BYTES);
+  let mask = 0;
+  for (let v = average; v > 1; v >>= 1) mask = mask << 1 | 1;
+  const slices = [];
+  const n = bytes.length;
+  let start = 0;
+  while (start < n) {
+    let end = Math.min(start + max, n);
+    if (end - start > min) {
+      let h = 0;
+      for (let i = start + min; i < end; i++) {
+        h = Math.imul(h, 2) + GEAR[bytes[i]] | 0;
+        if ((h & mask) === 0) {
+          end = i + 1;
+          break;
+        }
+      }
+    }
+    slices.push([start, end]);
+    start = end;
+  }
+  return slices;
+}
+
 // src/ignore.ts
 function escapeRegex(ch) {
   return /[a-zA-Z0-9_-]/.test(ch) ? ch : `\\${ch}`;
@@ -1075,6 +1115,8 @@ var MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024;
 var CHUNKED_ABOVE_BYTES = 16 * 1024 * 1024;
 var CHUNK_PLAINTEXT_BYTES = 8 * 1024 * 1024;
 var CHUNK_RETRIES = 2;
+var MAX_STAGING_CHUNKS = 1e5;
+var MAX_BASE_CHUNK_HASHES = 2048;
 var EXCLUDED_PREFIXES = [".trash/"];
 var IGNORE_FILE = ".syncignore";
 var EXCLUDED_NAMES = /* @__PURE__ */ new Set([".DS_Store", "Thumbs.db", "desktop.ini", IGNORE_FILE]);
@@ -1719,11 +1761,12 @@ var _SyncEngine = class _SyncEngine {
     );
     const journalEntry = {
       localMtime: file.stat.mtime,
-      remoteHash: uploaded.hash,
-      remoteMtime: uploaded.mtime,
+      remoteHash: uploaded.entry.hash,
+      remoteMtime: uploaded.entry.mtime,
       remoteVersion: version
     };
     this.setMergeBase(op.path, journalEntry, plaintext);
+    this.setBaseChunkHashes(journalEntry, uploaded.chunkHashes);
     this.putRecord(op.path, journalEntry);
     this.markJournalDirty();
     summary.pushed++;
@@ -1731,25 +1774,39 @@ var _SyncEngine = class _SyncEngine {
   /**
    * Encrypt `plaintext` for `path` under the setup's key at `version` and
    * upload it — single-shot for small files, chunked and resumable above
-   * CHUNKED_ABOVE_BYTES (PROB-3). Returns the server's index entry.
+   * CHUNKED_ABOVE_BYTES (PROB-3). Large files are cut by content-defined
+   * boundaries (IMP-7); the chunked result carries the plaintext chunk hashes
+   * for the journal's delta planning.
    */
   async encryptAndUpload(setup, path, plaintext, clientMtime, version) {
     const bytes = new Uint8Array(plaintext);
     if (plaintext.byteLength <= CHUNKED_ABOVE_BYTES) {
       const packet = await setup.crypto.encrypt(plaintext, setup.salt, path, version);
-      return setup.api.upload(path, packet, clientMtime, await sha256Hex(new Uint8Array(packet)), {
-        keyId: setup.keyIdHex,
-        fileVersion: version
-      });
+      const entry2 = await setup.api.upload(
+        path,
+        packet,
+        clientMtime,
+        await sha256Hex(new Uint8Array(packet)),
+        {
+          keyId: setup.keyIdHex,
+          fileVersion: version
+        }
+      );
+      return { entry: entry2, chunkHashes: null };
     }
-    const slices = [];
-    for (let o = 0; o < bytes.length; o += CHUNK_PLAINTEXT_BYTES) {
-      slices.push([o, Math.min(o + CHUNK_PLAINTEXT_BYTES, bytes.length)]);
+    let slices = cdcChunkSlices(bytes);
+    if (slices.length > MAX_STAGING_CHUNKS) {
+      slices = [];
+      for (let o = 0; o < bytes.length; o += CHUNK_PLAINTEXT_BYTES) {
+        slices.push([o, Math.min(o + CHUNK_PLAINTEXT_BYTES, bytes.length)]);
+      }
     }
+    const chunkHashes = new Array(slices.length);
     let manifestInput = new Uint8Array(slices.length * 32);
     for (let i = 0; i < slices.length; i++) {
       const [o, end] = slices[i];
       const h = await sha256Bytes(bytes.subarray(o, end));
+      chunkHashes[i] = toHex(h);
       manifestInput.set(h, i * 32);
     }
     const fileManifest = await sha256Bytes(manifestInput);
@@ -1777,11 +1834,12 @@ var _SyncEngine = class _SyncEngine {
       await this.putChunkWithRetry(setup, uploadId, i, packet);
       this.emitProgress({ index: i + 1, count: slices.length });
     }
-    return setup.api.commitUpload(uploadId, {
+    const entry = await setup.api.commitUpload(uploadId, {
       clientMtime,
       keyId: setup.keyIdHex,
       fileVersion: version
     });
+    return { entry, chunkHashes };
   }
   /** PUT one chunk with bounded retries (network errors) and status-based resume. */
   async putChunkWithRetry(setup, uploadId, n, packet) {
@@ -1909,6 +1967,17 @@ var _SyncEngine = class _SyncEngine {
     return /\.md$/i.test(path) && byteLength <= MERGE_MAX_BYTES;
   }
   /**
+   * IMP-7: store (or drop) the plaintext chunk hashes of the last upload —
+   * the delta-planning baseline. Capped to bound data.json growth.
+   */
+  setBaseChunkHashes(entry, chunkHashes) {
+    if (chunkHashes && chunkHashes.length > 0 && chunkHashes.length <= MAX_BASE_CHUNK_HASHES) {
+      entry.baseChunkHashes = chunkHashes;
+    } else {
+      delete entry.baseChunkHashes;
+    }
+  }
+  /**
    * Record (or drop) the merge base on a fresh journal entry. The base is
    * plaintext at rest in data.json — stored only while the toggle is on and
    * only for eligible notes, purged otherwise.
@@ -1965,11 +2034,12 @@ var _SyncEngine = class _SyncEngine {
     const uploaded = await this.encryptAndUpload(setup, op.path, mergedBuffer, mtime, version);
     const journalEntry = {
       localMtime: mtime,
-      remoteHash: uploaded.hash,
-      remoteMtime: uploaded.mtime,
+      remoteHash: uploaded.entry.hash,
+      remoteMtime: uploaded.entry.mtime,
       remoteVersion: version
     };
     this.setMergeBase(op.path, journalEntry, mergedBuffer);
+    this.setBaseChunkHashes(journalEntry, uploaded.chunkHashes);
     this.putRecord(op.path, journalEntry);
     this.markJournalDirty();
     summary.merged++;
@@ -2014,11 +2084,12 @@ var _SyncEngine = class _SyncEngine {
     );
     const entry = {
       localMtime: local.stat.mtime,
-      remoteHash: uploaded.hash,
-      remoteMtime: uploaded.mtime,
+      remoteHash: uploaded.entry.hash,
+      remoteMtime: uploaded.entry.mtime,
       remoteVersion: version
     };
     this.setMergeBase(op.path, entry, plaintext);
+    this.setBaseChunkHashes(entry, uploaded.chunkHashes);
     this.putRecord(op.path, entry);
     this.markJournalDirty();
     summary.pushed++;
@@ -2080,11 +2151,12 @@ var _SyncEngine = class _SyncEngine {
     const written = this.ctx.app.vault.getAbstractFileByPath(conflictLocal);
     const conflictEntry = {
       localMtime: written instanceof import_obsidian2.TFile ? written.stat.mtime : local.stat.mtime,
-      remoteHash: uploaded.hash,
-      remoteMtime: uploaded.mtime,
+      remoteHash: uploaded.entry.hash,
+      remoteMtime: uploaded.entry.mtime,
       remoteVersion: version
     };
     this.setMergeBase(conflictPath, conflictEntry, null);
+    this.setBaseChunkHashes(conflictEntry, uploaded.chunkHashes);
     this.putRecord(conflictPath, conflictEntry);
     this.markJournalDirty();
     await this.doPull({ ...op, local: void 0, remoteKey: op.remoteKey }, setup, summary);
@@ -2300,11 +2372,12 @@ Both versions kept \u2014 local copy saved as: ${conflictLocal}`,
         const uploaded = await this.encryptAndUpload(setup, path, plaintext, file.stat.mtime, version);
         const repairEntry = {
           localMtime: file.stat.mtime,
-          remoteHash: uploaded.hash,
-          remoteMtime: uploaded.mtime,
+          remoteHash: uploaded.entry.hash,
+          remoteMtime: uploaded.entry.mtime,
           remoteVersion: version
         };
         this.setMergeBase(path, repairEntry, plaintext);
+        this.setBaseChunkHashes(repairEntry, uploaded.chunkHashes);
         this.putRecord(path, repairEntry);
         this.markJournalDirty();
         repaired.push(path);
@@ -2408,11 +2481,12 @@ Both versions kept \u2014 local copy saved as: ${conflictLocal}`,
         const uploaded = await this.encryptAndUpload(newSetup, path, plaintext, Date.now(), version);
         const rotationEntry = {
           localMtime: (_c = record == null ? void 0 : record.localMtime) != null ? _c : Date.now(),
-          remoteHash: uploaded.hash,
-          remoteMtime: uploaded.mtime,
+          remoteHash: uploaded.entry.hash,
+          remoteMtime: uploaded.entry.mtime,
           remoteVersion: version
         };
         this.setMergeBase(path, rotationEntry, plaintext);
+        this.setBaseChunkHashes(rotationEntry, uploaded.chunkHashes);
         this.putRecord(path, rotationEntry);
         this.markJournalDirty();
         done++;

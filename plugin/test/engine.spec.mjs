@@ -562,17 +562,25 @@ async function run() {
     equal(events[0].currentPath, 'notes/big.bin', 'progress carries the current path');
     equal(events[events.length - 1].done, 1, 'completion event counts the op as done');
 
-    // Chunked upload: 17.5 MiB -> 3 chunks of 8 MiB -> per-chunk events.
+    // Chunked upload: 17.5 MiB -> content-defined chunks -> per-chunk events.
     events.length = 0;
     const big = new Uint8Array(17.5 * 1024 * 1024);
-    for (let i = 0; i < big.length; i += 4096) big[i] = i & 0xff;
+    let x = 123456789 | 0;
+    for (let i = 0; i < big.length; i++) {
+      x ^= x << 13; x |= 0;
+      x ^= x >>> 17;
+      x ^= x << 5; x |= 0;
+      big[i] = x & 0xff;
+    }
     await a.vault.createBinary('media/huge.bin', big.buffer);
     await sync(a, 'chunked push');
     const chunkEvents = events.filter((e) => e.chunk);
-    deepEqual(chunkEvents.map((e) => e.chunk.index), [1, 2, 3], 'chunk events 1..3 in order');
-    deepEqual(chunkEvents.map((e) => e.chunk.count), [3, 3, 3], 'each chunk event knows the total');
-    ok(chunkEvents.every((e) => e.phase === 'push' && e.currentPath === 'media/huge.bin'),
-      'chunk events carry phase and path');
+    const n = chunkEvents[0]?.chunk.count ?? 0;
+    ok(n >= 3, `large file cut into ${n} content-defined chunks`);
+    deepEqual(chunkEvents.map((e) => e.chunk.index), Array.from({ length: n }, (_, i) => i + 1),
+      'chunk events 1..N in order');
+    ok(chunkEvents.every((e) => e.chunk.count === n && e.phase === 'push' && e.currentPath === 'media/huge.bin'),
+      'chunk events carry consistent count, phase and path');
   }
 
   console.log('[12] IMP-4: restore from server (fresh clone, never deletes)');
@@ -737,6 +745,50 @@ async function run() {
     const r = await b.engine.restoreFromServer();
     equal(r?.pulled, 1, 'restore pulls the surviving config file back');
     equal(await text(b, '.obsidian/appearance.json'), '{}\n', 'config content restored');
+  }
+
+  console.log('[17] IMP-7: baseChunkHashes journal + delta readiness');
+  {
+    const server = new FakeServer(cryptoMod);
+    const a = makeDevice('A', new FakeVault(), server);
+
+    const big = new Uint8Array(17.5 * 1024 * 1024);
+    let x = 123456789 | 0;
+    for (let i = 0; i < big.length; i++) {
+      x ^= x << 13; x |= 0;
+      x ^= x >>> 17;
+      x ^= x << 5; x |= 0;
+      big[i] = x & 0xff;
+    }
+    await a.vault.createBinary('media/huge.bin', big.buffer);
+    await sync(a, 'initial chunked push');
+
+    const base = a.journal['media/huge.bin']?.baseChunkHashes;
+    ok(Array.isArray(base) && base.length >= 3 && base.every((h) => /^[0-9a-f]{64}$/.test(h)),
+      `journal stores the plaintext chunk hashes (${base?.length ?? 0} chunks)`);
+    const manifest = server.files.get('media/huge.bin')?.entry.manifest;
+    ok(manifest && manifest.length === 64, 'server entry still carries the file manifest');
+    ok(base.length <= 2048, 'chunk hashes respect the journal cap');
+
+    // Small edit -> re-push: most chunk hashes must survive (delta readiness).
+    await a.vault.modifyBinary(a.vault.getAbstractFileByPath('media/huge.bin'), (() => {
+      const copy = big.slice();
+      copy[Math.floor(copy.length / 2)] ^= 0xff;
+      return copy.buffer;
+    })());
+    await sync(a, 're-push after a 1-byte edit');
+    const next = a.journal['media/huge.bin']?.baseChunkHashes;
+    ok(Array.isArray(next) && next.length > 0, 're-push refreshes the baseline');
+    const oldSet = new Set(base);
+    const kept = next.filter((h) => oldSet.has(h)).length;
+    ok(kept >= next.length * 0.9,
+      `>=90% of chunks unchanged after a 1-byte edit (${kept}/${next.length})`);
+    ok(kept < next.length, 'at least one chunk actually changed');
+
+    // Single-shot uploads carry no baseline.
+    await a.vault.createBinary('small.md', utf8('# small\n'));
+    await sync(a, 'small push');
+    ok(a.journal['small.md']?.baseChunkHashes === undefined, 'single-shot files have no baseline');
   }
 
   finish('engine.spec');
