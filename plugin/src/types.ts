@@ -52,6 +52,12 @@ export interface SyncRecord {
    * purged from every record when the toggle is off.
    */
   basePlain?: string;
+  /**
+   * IMP-5: set while the path matches the user's ignore patterns. Ignored
+   * records keep their history but plan no operations — ignoring never
+   * deletes; the server entry is left untouched.
+   */
+  ignored?: boolean;
 }
 
 export type SyncStatus = 'idle' | 'syncing' | 'synced' | 'error' | 'offline';
@@ -77,6 +83,11 @@ export interface PluginSettings {
    * merge base (plaintext) in this plugin's data.json.
    */
   enableMarkdownAutoMerge: boolean;
+  /**
+   * IMP-5: newline-separated glob patterns of vault paths that must never
+   * sync. Merged with the vault-root `.syncignore` file at every cycle.
+   */
+  ignorePatterns: string;
 }
 
 export const DEFAULT_SETTINGS: PluginSettings = {
@@ -86,6 +97,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   autoSyncMinutes: 5,
   rememberEncryptionPassword: true,
   enableMarkdownAutoMerge: false,
+  ignorePatterns: '',
 };
 
 /** Shape of the plugin's persisted data.json. */

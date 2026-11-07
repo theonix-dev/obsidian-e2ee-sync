@@ -599,6 +599,36 @@ async function run() {
     equal(declined.vault.getFiles().length, 0, 'declined restore pulls nothing');
   }
 
+  console.log('[13] IMP-5: .syncignore — no ops, server untouched, journal flagged');
+  {
+    const server = new FakeServer(cryptoMod);
+    const a = makeDevice('A', new FakeVault(), server);
+    const b = makeDevice('B', new FakeVault(), server);
+
+    await a.vault.createBinary('private/x.md', utf8('secret\n'));
+    await a.vault.createBinary('open.md', utf8('open\n'));
+    await sync(a, 'A pushes both');
+    await sync(b, 'B pulls both');
+    equal(await text(b, 'private/x.md'), 'secret\n', 'B has the file before ignoring it');
+
+    // B adds a .syncignore (device-local) and syncs.
+    await b.vault.createBinary('.syncignore', utf8('private/\n'));
+    const summary = await sync(b, 'B cycle with .syncignore');
+    equal(summary?.pushed, 0, 'nothing pushed');
+    equal(summary?.pulled, 0, 'nothing pulled');
+    equal([...server.files.keys()].includes('.syncignore'), false,
+      'the .syncignore file itself never syncs');
+    ok(server.files.get('private/x.md') && !server.files.get('private/x.md').entry.deleted,
+      'the server entry for the newly-ignored path is left untouched (never delete)');
+    equal(b.journal['private/x.md']?.ignored, true, 'the journal flags the ignored record');
+    equal(b.journal['open.md']?.ignored, undefined, 'non-ignored records are not flagged');
+
+    // Removing the policy re-enables the path; the flag clears.
+    await b.vault.trash(b.vault.getAbstractFileByPath('.syncignore'));
+    await sync(b, 'B cycle without .syncignore');
+    equal(b.journal['private/x.md']?.ignored, undefined, 'the flag clears when the path syncs again');
+  }
+
   finish('engine.spec');
 }
 

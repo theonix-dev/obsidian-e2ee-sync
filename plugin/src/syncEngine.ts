@@ -62,6 +62,8 @@ import {
   toHex,
 } from './crypto';
 import type { PluginSettings, RemoteFileInfo, RemoteIndex, SyncRecord, SyncStatus } from './types';
+import { ignoreMatcherFromSources } from './ignore';
+import type { IgnoreMatcher } from './ignore';
 import { MERGE_MAX_BYTES, merge3 } from './merge';
 import type { ProgressLike } from './util';
 import { errorMessage } from './util';
@@ -113,8 +115,10 @@ const CHUNK_RETRIES = 2;
 
 /** Vault folders that must never round-trip to the server. */
 const EXCLUDED_PREFIXES = ['.trash/'];
-/** OS-generated junk that must never round-trip to the server. */
-const EXCLUDED_NAMES = new Set(['.DS_Store', 'Thumbs.db', 'desktop.ini']);
+/** IMP-5: the device-local ignore policy file itself never syncs. */
+export const IGNORE_FILE = '.syncignore';
+/** OS-generated junk and device-local policy files that never round-trip. */
+const EXCLUDED_NAMES = new Set(['.DS_Store', 'Thumbs.db', 'desktop.ini', IGNORE_FILE]);
 
 /**
  * Single canonical form for journal keys, remote keys, AAD and API
@@ -125,7 +129,12 @@ export function canonicalPath(p: string): string {
   return normalizePath(p).normalize('NFC');
 }
 
-export function isSyncablePath(p: string, configDir: string): boolean {
+/**
+ * Whether a vault-relative path may sync. `ignores` (IMP-5) carries the
+ * user's glob patterns; ignored paths are excluded from every plan and never
+ * deleted server-side.
+ */
+export function isSyncablePath(p: string, configDir: string, ignores?: IgnoreMatcher | null): boolean {
   if (isVerifierPath(p)) return false;
   const name = p.slice(p.lastIndexOf('/') + 1);
   if (EXCLUDED_NAMES.has(name)) return false;
@@ -133,6 +142,7 @@ export function isSyncablePath(p: string, configDir: string): boolean {
   for (const prefix of prefixes) {
     if (p === prefix.slice(0, -1) || p.startsWith(prefix)) return false;
   }
+  if (ignores?.isIgnored(p)) return false;
   return true;
 }
 
@@ -245,6 +255,7 @@ export function planSync(
   remote: Map<string, { key: string; info: RemoteFileInfo }>,
   journal: Record<string, SyncRecord>,
   configDir: string,
+  ignores?: IgnoreMatcher | null,
 ): Array<{ action: SyncAction; path: string; remoteKey?: string; local?: FileStatLike; remote?: RemoteFileInfo }> {
   const ops: Array<{
     action: SyncAction;
@@ -283,7 +294,7 @@ export function planSync(
   ]);
 
   for (const path of paths) {
-    if (!isSyncablePath(path, configDir)) continue;
+    if (!isSyncablePath(path, configDir, ignores)) continue;
     if (caseRenamed.has(path)) continue; // handled by the rename op above
 
     const local = locals.get(path);
@@ -406,6 +417,39 @@ export class SyncEngine {
   private conflictPromptChain: Promise<void> = Promise.resolve();
   /** Where the running cycle's progress counter stands (IMP-3). */
   private progressState: { done: number; total: number; phase: string; path: string } | null = null;
+  /** IMP-5: compiled ignore matcher, cached by (settings + .syncignore) text. */
+  private ignoreCache: { signature: string; matcher: IgnoreMatcher } | null = null;
+
+  /** Read the vault-root `.syncignore` (device-local policy; never synced). */
+  private async readSyncIgnoreFile(): Promise<string> {
+    const file = this.ctx.app.vault.getAbstractFileByPath(IGNORE_FILE);
+    if (!(file instanceof TFile)) return '';
+    try {
+      return new TextDecoder().decode(await this.ctx.app.vault.readBinary(file));
+    } catch {
+      return '';
+    }
+  }
+
+  /** Fresh matcher from the settings textarea + `.syncignore`, cached by content. */
+  private async currentIgnoreMatcher(): Promise<IgnoreMatcher> {
+    const fileText = await this.readSyncIgnoreFile();
+    const signature = `${this.ctx.getSettings().ignorePatterns ?? ''}\u0000${fileText}`;
+    if (this.ignoreCache && this.ignoreCache.signature === signature) {
+      return this.ignoreCache.matcher;
+    }
+    const matcher = ignoreMatcherFromSources(this.ctx.getSettings().ignorePatterns, fileText);
+    this.ignoreCache = { signature, matcher };
+    return matcher;
+  }
+
+  /** Synchronous matcher for event hot paths (uses the last cached compile). */
+  private ignoreMatcherSync(): IgnoreMatcher {
+    return (
+      this.ignoreCache?.matcher ??
+      ignoreMatcherFromSources(this.ctx.getSettings().ignorePatterns)
+    );
+  }
 
   /** Canonical paths we are writing ourselves; vault events for them are ignored. */
   private readonly ignorePaths = new Set<string>();
@@ -462,15 +506,16 @@ export class SyncEngine {
    * logic handles both halves naturally, so we just schedule a sync run.
    */
   onLocalRenamed(oldPath: string, newPath: string): void {
-    const oldSyncable = isSyncablePath(canonicalPath(oldPath), this.configDir);
-    const newSyncable = isSyncablePath(canonicalPath(newPath), this.configDir);
+    const ignores = this.ignoreMatcherSync();
+    const oldSyncable = isSyncablePath(canonicalPath(oldPath), this.configDir, ignores);
+    const newSyncable = isSyncablePath(canonicalPath(newPath), this.configDir, ignores);
     if (oldSyncable) this.onLocalTouched(oldPath);
     if (newSyncable) this.onLocalTouched(newPath);
   }
 
   private onLocalTouched(rawPath: string): void {
     const path = canonicalPath(rawPath);
-    if (!isSyncablePath(path, this.configDir) || this.ignorePaths.has(path)) return;
+    if (!isSyncablePath(path, this.configDir, this.ignoreMatcherSync()) || this.ignorePaths.has(path)) return;
     const existing = this.debounces.get(path);
     if (existing !== undefined) window.clearTimeout(existing);
 
@@ -532,7 +577,8 @@ export class SyncEngine {
       this.ctx.setStatus('syncing');
 
       const remote = this.canonicalizeRemote(indexResult.index.files ?? {});
-      const locals = this.collectLocalFiles();
+      const ignores = await this.currentIgnoreMatcher();
+      const locals = this.collectLocalFiles(ignores);
       const journal = this.ctx.getJournal();
 
       // IMP-1 hygiene: with the toggle off no merge base may stay at rest in
@@ -543,7 +589,25 @@ export class SyncEngine {
         }
       }
 
-      const plan: PlannedOp[] = planSync(locals, remote, journal, this.configDir);
+      const plan: PlannedOp[] = planSync(locals, remote, journal, this.configDir, ignores);
+
+      // IMP-5 bookkeeping: flag records of newly-ignored paths ("ignored",
+      // left untouched on the server) and clear the flag when a path becomes
+      // syncable again.
+      let ignoreFlagsChanged = false;
+      for (const [path, rec] of Object.entries(journal)) {
+        if (!rec) continue;
+        if (isSyncablePath(path, this.configDir, ignores)) {
+          if (rec.ignored) {
+            delete rec.ignored;
+            ignoreFlagsChanged = true;
+          }
+        } else if (!rec.ignored) {
+          rec.ignored = true;
+          ignoreFlagsChanged = true;
+        }
+      }
+      if (ignoreFlagsChanged) this.markJournalDirty();
       this.planLocals = locals;
 
       // Mass-wipe guard: a compromised server (or stolen token) can forge
@@ -620,11 +684,11 @@ export class SyncEngine {
     return remote;
   }
 
-  private collectLocalFiles(): Map<string, TFile> {
+  private collectLocalFiles(ignores?: IgnoreMatcher | null): Map<string, TFile> {
     const out = new Map<string, TFile>();
     for (const file of this.ctx.app.vault.getFiles()) {
       const path = canonicalPath(file.path);
-      if (!isSyncablePath(path, this.configDir)) continue;
+      if (!isSyncablePath(path, this.configDir, ignores)) continue;
       // Two local files canonicalizing to the same key (an NFD/NFC pair on a
       // normalization-sensitive FS): the first one wins; the duplicate is
       // re-planned as an unsynced file once the primary is resolved.
@@ -1357,9 +1421,10 @@ export class SyncEngine {
       this.lastIndexEtag = '';
 
       const remote = this.canonicalizeRemote(index.files ?? {});
-      const plan: PlannedOp[] = planSync(new Map(), remote, {}, this.configDir);
+      const ignores = await this.currentIgnoreMatcher();
+      const plan: PlannedOp[] = planSync(new Map(), remote, {}, this.configDir, ignores);
       // planLocals feeds the write-time case-collision guard in doPull.
-      this.planLocals = this.collectLocalFiles();
+      this.planLocals = this.collectLocalFiles(ignores);
       this.ctx.setStatus('syncing', `restoring ${liveCount} file(s)…`);
       const summary = await this.executePlan(plan, setup);
       await this.flushJournal(true);

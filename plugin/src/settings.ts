@@ -90,6 +90,19 @@ export class E2eeSyncSettingTab extends PluginSettingTab {
             },
           },
           {
+            name: 'Ignore patterns',
+            desc:
+              'One glob per line — these paths never sync and are never deleted from the server: ' +
+              '"private/" (a folder at any depth), "*.bak", "notes/draft.md". Patterns with a slash are ' +
+              'anchored to the vault root; "*" and "?" stay inside one folder level, "**" crosses them. ' +
+              'A .syncignore file in the vault root is merged with this list.',
+            control: {
+              type: 'textarea',
+              key: 'ignorePatterns',
+              placeholder: 'private/\n*.bak',
+            },
+          },
+          {
             name: 'Auto-merge Markdown conflicts',
             desc:
               'EXPERIMENTAL, off by default. When two devices edit different parts of the same note, ' +

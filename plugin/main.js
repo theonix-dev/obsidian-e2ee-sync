@@ -641,6 +641,110 @@ var CryptoManager = class {
   }
 };
 
+// src/ignore.ts
+function escapeRegex(ch) {
+  return /[a-zA-Z0-9_-]/.test(ch) ? ch : `\\${ch}`;
+}
+function globToRegexSource(glob) {
+  let out = "";
+  let i = 0;
+  while (i < glob.length) {
+    if (glob.startsWith("**/", i)) {
+      out += "(?:.*/)?";
+      i += 3;
+      continue;
+    }
+    if (glob.startsWith("/**/", i)) {
+      out += "(?:/.*)?/";
+      i += 4;
+      continue;
+    }
+    if (glob[i] === "*" && glob[i + 1] === "*") {
+      out += ".*";
+      i += 2;
+      continue;
+    }
+    const ch = glob[i];
+    if (ch === "*") out += "[^/]*";
+    else if (ch === "?") out += "[^/]";
+    else out += escapeRegex(ch);
+    i++;
+  }
+  return out;
+}
+function compileLine(raw) {
+  let pattern = raw.trim();
+  if (pattern === "" || pattern.startsWith("#")) return null;
+  const dirOnly = pattern.endsWith("/");
+  if (dirOnly) pattern = pattern.slice(0, -1);
+  if (pattern === "") return null;
+  const anchored = pattern.includes("/");
+  pattern = pattern.replace(/^\/+/, "");
+  if (pattern === "") return null;
+  const source = globToRegexSource(pattern);
+  const flags = "";
+  if (anchored) {
+    return {
+      source: pattern,
+      regex: new RegExp(`^${source}$`, flags),
+      segmentMatch: false,
+      dirOnly
+    };
+  }
+  return {
+    source: pattern,
+    regex: new RegExp(`^${source}$`, flags),
+    segmentMatch: true,
+    dirOnly
+  };
+}
+function compileIgnorePatterns(text) {
+  const lines = (text != null ? text : "").split(/\r?\n/);
+  const compiled = [];
+  const accepted = [];
+  for (const line of lines) {
+    const c = compileLine(line);
+    if (c) {
+      compiled.push(c);
+      accepted.push(c.source + (c.dirOnly ? "/" : ""));
+    }
+  }
+  const segmentsOf = (path) => path.split("/").filter((s) => s !== "");
+  const ancestorsOf = (path) => {
+    const segs = segmentsOf(path);
+    const out = [];
+    for (let i = 1; i < segs.length; i++) out.push(segs.slice(0, i).join("/"));
+    return out;
+  };
+  return {
+    patterns: accepted,
+    isIgnored(path) {
+      if (compiled.length === 0) return false;
+      const clean = path.replace(/^\/+/, "");
+      if (clean === "") return false;
+      const segs = segmentsOf(clean);
+      const ancestors = ancestorsOf(clean);
+      for (const c of compiled) {
+        if (c.segmentMatch) {
+          const segCount = c.dirOnly ? segs.length - 1 : segs.length;
+          for (let i = 0; i < segCount; i++) {
+            if (c.regex.test(segs[i])) return true;
+          }
+          continue;
+        }
+        if (!c.dirOnly && c.regex.test(clean)) return true;
+        for (const dir of ancestors) {
+          if (c.regex.test(dir)) return true;
+        }
+      }
+      return false;
+    }
+  };
+}
+function ignoreMatcherFromSources(...sources) {
+  return compileIgnorePatterns(sources.filter((s) => s && s.trim() !== "").join("\n"));
+}
+
 // src/merge.ts
 var MERGE_MAX_BYTES = 512 * 1024;
 var MAX_DIFF_D = 2048;
@@ -972,11 +1076,12 @@ var CHUNKED_ABOVE_BYTES = 16 * 1024 * 1024;
 var CHUNK_PLAINTEXT_BYTES = 8 * 1024 * 1024;
 var CHUNK_RETRIES = 2;
 var EXCLUDED_PREFIXES = [".trash/"];
-var EXCLUDED_NAMES = /* @__PURE__ */ new Set([".DS_Store", "Thumbs.db", "desktop.ini"]);
+var IGNORE_FILE = ".syncignore";
+var EXCLUDED_NAMES = /* @__PURE__ */ new Set([".DS_Store", "Thumbs.db", "desktop.ini", IGNORE_FILE]);
 function canonicalPath(p) {
   return (0, import_obsidian2.normalizePath)(p).normalize("NFC");
 }
-function isSyncablePath(p, configDir) {
+function isSyncablePath(p, configDir, ignores) {
   if (isVerifierPath(p)) return false;
   const name = p.slice(p.lastIndexOf("/") + 1);
   if (EXCLUDED_NAMES.has(name)) return false;
@@ -984,10 +1089,11 @@ function isSyncablePath(p, configDir) {
   for (const prefix of prefixes) {
     if (p === prefix.slice(0, -1) || p.startsWith(prefix)) return false;
   }
+  if (ignores == null ? void 0 : ignores.isIgnored(p)) return false;
   return true;
 }
 var CONFLICT_PROMPT_LIMIT = 5;
-function planSync(locals, remote, journal, configDir) {
+function planSync(locals, remote, journal, configDir, ignores) {
   var _a;
   const ops = [];
   const byLower = /* @__PURE__ */ new Map();
@@ -1012,7 +1118,7 @@ function planSync(locals, remote, journal, configDir) {
     ...remote.keys()
   ]);
   for (const path of paths) {
-    if (!isSyncablePath(path, configDir)) continue;
+    if (!isSyncablePath(path, configDir, ignores)) continue;
     if (caseRenamed.has(path)) continue;
     const local = locals.get(path);
     const record = journal[path];
@@ -1097,6 +1203,8 @@ var SyncEngine = class _SyncEngine {
     this.conflictPromptChain = Promise.resolve();
     /** Where the running cycle's progress counter stands (IMP-3). */
     this.progressState = null;
+    /** IMP-5: compiled ignore matcher, cached by (settings + .syncignore) text. */
+    this.ignoreCache = null;
     /** Canonical paths we are writing ourselves; vault events for them are ignored. */
     this.ignorePaths = /* @__PURE__ */ new Set();
     /** Per-path debounce timers, keyed by canonical path. */
@@ -1109,6 +1217,33 @@ var SyncEngine = class _SyncEngine {
     /** Local files snapshot of the running cycle (case-collision checks). */
     this.planLocals = null;
     this.configDir = ctx.app.vault.configDir;
+  }
+  /** Read the vault-root `.syncignore` (device-local policy; never synced). */
+  async readSyncIgnoreFile() {
+    const file = this.ctx.app.vault.getAbstractFileByPath(IGNORE_FILE);
+    if (!(file instanceof import_obsidian2.TFile)) return "";
+    try {
+      return new TextDecoder().decode(await this.ctx.app.vault.readBinary(file));
+    } catch (e) {
+      return "";
+    }
+  }
+  /** Fresh matcher from the settings textarea + `.syncignore`, cached by content. */
+  async currentIgnoreMatcher() {
+    var _a;
+    const fileText = await this.readSyncIgnoreFile();
+    const signature = `${(_a = this.ctx.getSettings().ignorePatterns) != null ? _a : ""}\0${fileText}`;
+    if (this.ignoreCache && this.ignoreCache.signature === signature) {
+      return this.ignoreCache.matcher;
+    }
+    const matcher = ignoreMatcherFromSources(this.ctx.getSettings().ignorePatterns, fileText);
+    this.ignoreCache = { signature, matcher };
+    return matcher;
+  }
+  /** Synchronous matcher for event hot paths (uses the last cached compile). */
+  ignoreMatcherSync() {
+    var _a, _b;
+    return (_b = (_a = this.ignoreCache) == null ? void 0 : _a.matcher) != null ? _b : ignoreMatcherFromSources(this.ctx.getSettings().ignorePatterns);
   }
   dispose() {
     for (const t of this.debounces.values()) window.clearTimeout(t);
@@ -1140,14 +1275,15 @@ var SyncEngine = class _SyncEngine {
    * logic handles both halves naturally, so we just schedule a sync run.
    */
   onLocalRenamed(oldPath, newPath) {
-    const oldSyncable = isSyncablePath(canonicalPath(oldPath), this.configDir);
-    const newSyncable = isSyncablePath(canonicalPath(newPath), this.configDir);
+    const ignores = this.ignoreMatcherSync();
+    const oldSyncable = isSyncablePath(canonicalPath(oldPath), this.configDir, ignores);
+    const newSyncable = isSyncablePath(canonicalPath(newPath), this.configDir, ignores);
     if (oldSyncable) this.onLocalTouched(oldPath);
     if (newSyncable) this.onLocalTouched(newPath);
   }
   onLocalTouched(rawPath) {
     const path = canonicalPath(rawPath);
-    if (!isSyncablePath(path, this.configDir) || this.ignorePaths.has(path)) return;
+    if (!isSyncablePath(path, this.configDir, this.ignoreMatcherSync()) || this.ignorePaths.has(path)) return;
     const existing = this.debounces.get(path);
     if (existing !== void 0) window.clearTimeout(existing);
     const timer = window.setTimeout(() => {
@@ -1204,14 +1340,29 @@ var SyncEngine = class _SyncEngine {
       this.lastIndexEtag = indexResult.etag;
       this.ctx.setStatus("syncing");
       const remote = this.canonicalizeRemote((_b = indexResult.index.files) != null ? _b : {});
-      const locals = this.collectLocalFiles();
+      const ignores = await this.currentIgnoreMatcher();
+      const locals = this.collectLocalFiles(ignores);
       const journal = this.ctx.getJournal();
       if (!settings.enableMarkdownAutoMerge) {
         for (const record of Object.values(journal)) {
           if ((record == null ? void 0 : record.basePlain) !== void 0) delete record.basePlain;
         }
       }
-      const plan = planSync(locals, remote, journal, this.configDir);
+      const plan = planSync(locals, remote, journal, this.configDir, ignores);
+      let ignoreFlagsChanged = false;
+      for (const [path, rec] of Object.entries(journal)) {
+        if (!rec) continue;
+        if (isSyncablePath(path, this.configDir, ignores)) {
+          if (rec.ignored) {
+            delete rec.ignored;
+            ignoreFlagsChanged = true;
+          }
+        } else if (!rec.ignored) {
+          rec.ignored = true;
+          ignoreFlagsChanged = true;
+        }
+      }
+      if (ignoreFlagsChanged) this.markJournalDirty();
       this.planLocals = locals;
       const deletes = plan.filter((op) => op.action === "delete-local");
       if (deletes.length > 0 && deletes.length >= this.massDeleteThreshold(locals.size) && this.ctx.confirmMassDeletion && !await this.ctx.confirmMassDeletion(deletes.length, locals.size)) {
@@ -1275,11 +1426,11 @@ var SyncEngine = class _SyncEngine {
     }
     return remote;
   }
-  collectLocalFiles() {
+  collectLocalFiles(ignores) {
     const out = /* @__PURE__ */ new Map();
     for (const file of this.ctx.app.vault.getFiles()) {
       const path = canonicalPath(file.path);
-      if (!isSyncablePath(path, this.configDir)) continue;
+      if (!isSyncablePath(path, this.configDir, ignores)) continue;
       if (!out.has(path)) out.set(path, file);
     }
     return out;
@@ -1901,8 +2052,9 @@ Both versions kept \u2014 local copy saved as: ${conflictPath}`,
       }
       this.lastIndexEtag = "";
       const remote = this.canonicalizeRemote((_c = index.files) != null ? _c : {});
-      const plan = planSync(/* @__PURE__ */ new Map(), remote, {}, this.configDir);
-      this.planLocals = this.collectLocalFiles();
+      const ignores = await this.currentIgnoreMatcher();
+      const plan = planSync(/* @__PURE__ */ new Map(), remote, {}, this.configDir, ignores);
+      this.planLocals = this.collectLocalFiles(ignores);
       this.ctx.setStatus("syncing", `restoring ${liveCount} file(s)\u2026`);
       const summary = await this.executePlan(plan, setup);
       await this.flushJournal(true);
@@ -2438,6 +2590,15 @@ var E2eeSyncSettingTab = class extends import_obsidian3.PluginSettingTab {
             }
           },
           {
+            name: "Ignore patterns",
+            desc: 'One glob per line \u2014 these paths never sync and are never deleted from the server: "private/" (a folder at any depth), "*.bak", "notes/draft.md". Patterns with a slash are anchored to the vault root; "*" and "?" stay inside one folder level, "**" crosses them. A .syncignore file in the vault root is merged with this list.',
+            control: {
+              type: "textarea",
+              key: "ignorePatterns",
+              placeholder: "private/\n*.bak"
+            }
+          },
+          {
             name: "Auto-merge Markdown conflicts",
             desc: "EXPERIMENTAL, off by default. When two devices edit different parts of the same note, the changes are merged automatically instead of keeping both copies (overlapping edits still keep both). Trade-off: to compute a merge this device stores a plaintext copy of the last synced state of every .md note in the plugin\u2019s data.json \u2014 unencrypted at rest inside your vault (the notes themselves are plaintext there too, but tools that read data.json would see note content even if the notes were moved elsewhere).",
             control: {
@@ -2530,7 +2691,8 @@ var DEFAULT_SETTINGS = {
   encryptionPassword: "",
   autoSyncMinutes: 5,
   rememberEncryptionPassword: true,
-  enableMarkdownAutoMerge: false
+  enableMarkdownAutoMerge: false,
+  ignorePatterns: ""
 };
 
 // src/main.ts

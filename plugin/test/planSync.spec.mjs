@@ -253,6 +253,35 @@ async function run() {
     ok(ops.length === 1 && ops[0].action === 'forget', 'stale journal entry is forgotten');
   }
 
+  console.log('[8] user ignore patterns (IMP-5): ignored paths plan nothing, never delete');
+  {
+    // A matcher stub standing in for src/ignore.ts's compiled patterns.
+    const ignores = { isIgnored: (p) => p.startsWith('private') };
+    const locals = new Map([
+      ['private/x.md', file('private/x.md')],
+      ['open.md', file('open.md')],
+    ]);
+    const remote = new Map([
+      ['private/x.md', { key: 'private/x.md', info: liveInfo(HASH_B) }],
+      // hash unchanged vs the record -> the unfiltered planner plans delete-remote
+      ['private/gone.md', { key: 'private/gone.md', info: liveInfo(HASH_A) }],
+      ['open.md', { key: 'open.md', info: liveInfo(HASH_A) }],
+    ]);
+    const journal = { 'private/gone.md': record(MTIME, HASH_A) };
+    const ops = planSync(locals, remote, journal, CONFIG_DIR, ignores);
+    ok(!ops.some((o) => o.path.startsWith('private')), 'ignored paths plan zero ops of any kind');
+    ok(
+      !ops.some((o) => o.path === 'private/gone.md' && o.action === 'delete-remote'),
+      'ignoring never propagates a deletion to the server',
+    );
+    ok(ops.some((o) => o.path === 'open.md' && o.action === 'pull'),
+      'non-ignored paths plan normally');
+    // Without the matcher the very same state plans the deletions/pulls.
+    const unfiltered = planSync(locals, remote, journal, CONFIG_DIR);
+    ok(unfiltered.some((o) => o.path === 'private/gone.md' && o.action === 'delete-remote'),
+      'without a matcher the planner behaves exactly as before');
+  }
+
   finish('planSync.spec');
 }
 
