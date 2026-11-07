@@ -909,6 +909,23 @@ function errorMessage(error) {
     return String(error);
   }
 }
+var PHASE_VERBS = {
+  push: "uploading",
+  pull: "downloading",
+  conflict: "resolving",
+  delete: "deleting",
+  forget: "cleaning"
+};
+function formatProgress(p) {
+  var _a;
+  const verb = (_a = PHASE_VERBS[p.phase]) != null ? _a : "syncing";
+  const base = `${p.done}/${p.total} \u2014 ${verb} ${p.currentPath}`;
+  if (p.chunk && p.chunk.count > 1) {
+    const pct = Math.min(100, Math.max(0, Math.round(p.chunk.index / p.chunk.count * 100)));
+    return `${base} (${pct}%)`;
+  }
+  return base;
+}
 function isLocalHost(hostname) {
   return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
 }
@@ -1056,7 +1073,7 @@ function rollbackReason(recordVersion, packetVersion) {
   }
   return null;
 }
-var SyncEngine = class {
+var SyncEngine = class _SyncEngine {
   constructor(ctx) {
     this.ctx = ctx;
     this.api = null;
@@ -1078,6 +1095,8 @@ var SyncEngine = class {
     this.conflictsAsked = 0;
     /** Serializes conflict prompts — one modal at a time despite the pool. */
     this.conflictPromptChain = Promise.resolve();
+    /** Where the running cycle's progress counter stands (IMP-3). */
+    this.progressState = null;
     /** Canonical paths we are writing ourselves; vault events for them are ignored. */
     this.ignorePaths = /* @__PURE__ */ new Set();
     /** Per-path debounce timers, keyed by canonical path. */
@@ -1290,6 +1309,31 @@ var SyncEngine = class {
     );
     await Promise.all(workers);
   }
+  /** IMP-3: map a planned action to its progress phase. */
+  static progressPhase(action) {
+    switch (action) {
+      case "push":
+        return "push";
+      case "pull":
+        return "pull";
+      case "conflict":
+      case "case-rename":
+        return "conflict";
+      case "delete-local":
+      case "delete-remote":
+        return "delete";
+      case "forget":
+        return "forget";
+    }
+  }
+  /** IMP-3: report progress to the context, if a UI subscribed. */
+  emitProgress(chunk) {
+    const s = this.progressState;
+    if (!s || !this.ctx.setProgress) return;
+    const p = { done: s.done, total: s.total, phase: s.phase, currentPath: s.path };
+    if (chunk) p.chunk = chunk;
+    this.ctx.setProgress(p);
+  }
   /**
    * Execute the plan with bounded parallelism (PROB-7): downloads ×3, uploads
    * (pushes + conflicts) ×2, destructive/local-mutating ops serialized ×1.
@@ -1308,7 +1352,11 @@ var SyncEngine = class {
       deletedRemote: 0,
       failures: []
     };
+    let done = 0;
+    const total = plan.length;
     const runOp = async (op) => {
+      this.progressState = { done, total, phase: _SyncEngine.progressPhase(op.action), path: op.path };
+      this.emitProgress();
       try {
         switch (op.action) {
           case "forget":
@@ -1336,6 +1384,10 @@ var SyncEngine = class {
         }
       } catch (error) {
         summary.failures.push({ path: op.path, error: errorMessage(error) });
+      } finally {
+        done++;
+        if (this.progressState) this.progressState.done = done;
+        this.emitProgress();
       }
     };
     const forgets = [];
@@ -1352,6 +1404,7 @@ var SyncEngine = class {
     await this.runPool(serialized, 1, runOp);
     await this.runPool(uploads, 2, runOp);
     await this.runPool(downloads, 3, runOp);
+    this.progressState = null;
     if (summary.failures.length > 0) {
       const first = summary.failures[0];
       this.ctx.notify(
@@ -1439,6 +1492,7 @@ var SyncEngine = class {
         fileManifest
       );
       await this.putChunkWithRetry(setup, uploadId, i, packet);
+      this.emitProgress({ index: i + 1, count: slices.length });
     }
     return setup.api.commitUpload(uploadId, {
       clientMtime,
@@ -2620,7 +2674,8 @@ var E2eeSyncPlugin = class extends import_obsidian4.Plugin {
       promptPassword: (reason) => this.promptForChangedPassword(reason),
       resolveConflict: (path) => new Promise((resolve) => {
         new ConflictModal(this.app, path, resolve).open();
-      })
+      }),
+      setProgress: (progress) => this.showProgress(progress)
     });
     this.addSettingTab(new E2eeSyncSettingTab(this.app, this));
     this.ribbonEl = this.addRibbonIcon("refresh-cw", "E2EE Sync: sync now", () => {
@@ -2865,6 +2920,16 @@ var E2eeSyncPlugin = class extends import_obsidian4.Plugin {
     }
   }
   // ------------------------------------------------------------- status ui
+  /**
+   * IMP-3: live cycle progress in the status bar (and the ribbon label, since
+   * the status bar is hidden on mobile) while the engine is mid-run. The
+   * status class stays 'syncing'; the next updateStatus() call resets the text.
+   */
+  showProgress(progress) {
+    const text = formatProgress(progress);
+    if (this.statusBarEl) this.statusBarEl.setText(`E2EE Sync: ${text}`);
+    if (this.ribbonEl) this.ribbonEl.setAttribute("aria-label", `E2EE Sync: ${text}`);
+  }
   updateStatus(status, message) {
     const icons = {
       idle: "refresh-cw",

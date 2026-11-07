@@ -235,6 +235,7 @@ async function run() {
       confirmMassDeletion: async () => true,
       createApi: () => server, // shared fake server = the network
       resolveConflict: opts.resolveConflict,
+      setProgress: opts.setProgress,
     });
     return { name, engine: eng, vault, journal, notices, statuses, settings, getPersisted: () => persisted };
   };
@@ -528,6 +529,34 @@ async function run() {
     const summary = await b.engine.runFullSync(true); // interactive run
     equal(asked, 7, 'interactive run prompts for every conflict');
     equal(summary?.skipped, 7, 'all skipped by the user');
+  }
+
+  console.log('[11] IMP-3: progress events per op and per chunk');
+  {
+    const server = new FakeServer(cryptoMod);
+    const events = [];
+    const a = makeDevice('A', new FakeVault(), server, {
+      setProgress: (p) => events.push(p),
+    });
+
+    await a.vault.createBinary('notes/big.bin', utf8('# small start\n'));
+    await sync(a, 'small push');
+    equal(events.filter((e) => e.total === 1 && e.phase === 'push').length, 2,
+      'small file: start + completion events for one push');
+    equal(events[0].currentPath, 'notes/big.bin', 'progress carries the current path');
+    equal(events[events.length - 1].done, 1, 'completion event counts the op as done');
+
+    // Chunked upload: 17.5 MiB -> 3 chunks of 8 MiB -> per-chunk events.
+    events.length = 0;
+    const big = new Uint8Array(17.5 * 1024 * 1024);
+    for (let i = 0; i < big.length; i += 4096) big[i] = i & 0xff;
+    await a.vault.createBinary('media/huge.bin', big.buffer);
+    await sync(a, 'chunked push');
+    const chunkEvents = events.filter((e) => e.chunk);
+    deepEqual(chunkEvents.map((e) => e.chunk.index), [1, 2, 3], 'chunk events 1..3 in order');
+    deepEqual(chunkEvents.map((e) => e.chunk.count), [3, 3, 3], 'each chunk event knows the total');
+    ok(chunkEvents.every((e) => e.phase === 'push' && e.currentPath === 'media/huge.bin'),
+      'chunk events carry phase and path');
   }
 
   finish('engine.spec');

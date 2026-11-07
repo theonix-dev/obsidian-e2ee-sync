@@ -63,6 +63,7 @@ import {
 } from './crypto';
 import type { PluginSettings, RemoteFileInfo, RemoteIndex, SyncRecord, SyncStatus } from './types';
 import { MERGE_MAX_BYTES, merge3 } from './merge';
+import type { ProgressLike } from './util';
 import { errorMessage } from './util';
 
 /** Per-file debounce window for local vault events (ms). */
@@ -214,6 +215,11 @@ export interface EngineContext {
    * choice, or null for "keep both" (Esc). Omitted => silent keep-both.
    */
   resolveConflict?(path: string): Promise<ConflictResolution | null>;
+  /**
+   * IMP-3: progress of the running cycle — emitted on every op start/completion
+   * and per chunk of large-file uploads. Omitted => no progress UI.
+   */
+  setProgress?(progress: ProgressLike): void;
 }
 
 // ------------------------------------------------------------ pure planner --
@@ -398,6 +404,8 @@ export class SyncEngine {
   private conflictsAsked = 0;
   /** Serializes conflict prompts — one modal at a time despite the pool. */
   private conflictPromptChain: Promise<void> = Promise.resolve();
+  /** Where the running cycle's progress counter stands (IMP-3). */
+  private progressState: { done: number; total: number; phase: string; path: string } | null = null;
 
   /** Canonical paths we are writing ourselves; vault events for them are ignored. */
   private readonly ignorePaths = new Set<string>();
@@ -653,6 +661,28 @@ export class SyncEngine {
     await Promise.all(workers);
   }
 
+  /** IMP-3: map a planned action to its progress phase. */
+  private static progressPhase(action: SyncAction): string {
+    switch (action) {
+      case 'push': return 'push';
+      case 'pull': return 'pull';
+      case 'conflict':
+      case 'case-rename': return 'conflict';
+      case 'delete-local':
+      case 'delete-remote': return 'delete';
+      case 'forget': return 'forget';
+    }
+  }
+
+  /** IMP-3: report progress to the context, if a UI subscribed. */
+  private emitProgress(chunk?: { index: number; count: number }): void {
+    const s = this.progressState;
+    if (!s || !this.ctx.setProgress) return;
+    const p: ProgressLike = { done: s.done, total: s.total, phase: s.phase, currentPath: s.path };
+    if (chunk) p.chunk = chunk;
+    this.ctx.setProgress(p);
+  }
+
   /**
    * Execute the plan with bounded parallelism (PROB-7): downloads ×3, uploads
    * (pushes + conflicts) ×2, destructive/local-mutating ops serialized ×1.
@@ -672,7 +702,11 @@ export class SyncEngine {
       failures: [],
     };
 
+    let done = 0;
+    const total = plan.length;
     const runOp = async (op: PlannedOp): Promise<void> => {
+      this.progressState = { done, total, phase: SyncEngine.progressPhase(op.action), path: op.path };
+      this.emitProgress();
       try {
         switch (op.action) {
           case 'forget':
@@ -700,6 +734,10 @@ export class SyncEngine {
         }
       } catch (error) {
         summary.failures.push({ path: op.path, error: errorMessage(error) });
+      } finally {
+        done++;
+        if (this.progressState) this.progressState.done = done;
+        this.emitProgress();
       }
     };
 
@@ -719,6 +757,7 @@ export class SyncEngine {
     await this.runPool(serialized, 1, runOp);
     await this.runPool(uploads, 2, runOp);
     await this.runPool(downloads, 3, runOp);
+    this.progressState = null;
 
     if (summary.failures.length > 0) {
       const first = summary.failures[0];
@@ -819,6 +858,8 @@ export class SyncEngine {
         chunkPlain.buffer as ArrayBuffer, setup.salt, path, version, i, fileManifest,
       );
       await this.putChunkWithRetry(setup, uploadId, i, packet);
+      // IMP-3: per-file percentage while a large upload is in flight.
+      this.emitProgress({ index: i + 1, count: slices.length });
     }
 
     return setup.api.commitUpload(uploadId, {

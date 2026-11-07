@@ -15,7 +15,8 @@ import type { ConflictResolution } from './syncEngine';
 import { E2eeSyncSettingTab } from './settings';
 import { DEFAULT_SETTINGS } from './types';
 import type { PluginData, PluginSettings, SyncRecord, SyncStatus } from './types';
-import { errorMessage } from './util';
+import type { ProgressLike } from './util';
+import { errorMessage, formatProgress } from './util';
 
 const STARTUP_SYNC_DELAY_MS = 4000;
 
@@ -261,6 +262,7 @@ export default class E2eeSyncPlugin extends Plugin {
         new Promise<ConflictResolution | null>((resolve) => {
           new ConflictModal(this.app, path, resolve).open();
         }),
+      setProgress: (progress) => this.showProgress(progress),
     });
 
     this.addSettingTab(new E2eeSyncSettingTab(this.app, this));
@@ -546,6 +548,17 @@ export default class E2eeSyncPlugin extends Plugin {
   }
 
   // ------------------------------------------------------------- status ui
+
+  /**
+   * IMP-3: live cycle progress in the status bar (and the ribbon label, since
+   * the status bar is hidden on mobile) while the engine is mid-run. The
+   * status class stays 'syncing'; the next updateStatus() call resets the text.
+   */
+  private showProgress(progress: ProgressLike): void {
+    const text = formatProgress(progress);
+    if (this.statusBarEl) this.statusBarEl.setText(`E2EE Sync: ${text}`);
+    if (this.ribbonEl) this.ribbonEl.setAttribute('aria-label', `E2EE Sync: ${text}`);
+  }
 
   private updateStatus(status: SyncStatus, message?: string): void {
     const icons: Record<SyncStatus, string> = {

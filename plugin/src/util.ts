@@ -10,6 +10,43 @@ export function errorMessage(error: unknown): string {
   }
 }
 
+// ------------------------------------------------------------ progress (IMP-3)
+
+/** Structural shape of the engine's progress reports (see SyncEngine). */
+export interface ProgressLike {
+  /** Ops finished in this cycle. */
+  done: number;
+  /** Ops planned for this cycle. */
+  total: number;
+  /** What kind of op `currentPath` is right now. */
+  phase: string;
+  currentPath: string;
+  /** Present while a chunked (large-file) transfer is in flight. */
+  chunk?: { index: number; count: number };
+}
+
+const PHASE_VERBS: Record<string, string> = {
+  push: 'uploading',
+  pull: 'downloading',
+  conflict: 'resolving',
+  delete: 'deleting',
+  forget: 'cleaning',
+};
+
+/**
+ * Status-bar/ribbon text for a running sync: "12/87 — uploading notes/x.md",
+ * with a per-file percentage while chunked transfers are in flight.
+ */
+export function formatProgress(p: ProgressLike): string {
+  const verb = PHASE_VERBS[p.phase] ?? 'syncing';
+  const base = `${p.done}/${p.total} — ${verb} ${p.currentPath}`;
+  if (p.chunk && p.chunk.count > 1) {
+    const pct = Math.min(100, Math.max(0, Math.round((p.chunk.index / p.chunk.count) * 100)));
+    return `${base} (${pct}%)`;
+  }
+  return base;
+}
+
 function isLocalHost(hostname: string): boolean {
   // Loopback only: mDNS ".local" names can be spoofed on hostile networks.
   return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]';
