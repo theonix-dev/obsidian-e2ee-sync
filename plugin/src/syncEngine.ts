@@ -144,12 +144,20 @@ export type SyncAction =
   | 'case-rename'
   | 'forget';
 
+/** IMP-2: user's choice for a conflicted file (null = Esc = keep both). */
+export type ConflictResolution = 'mine' | 'remote' | 'both' | 'skip';
+
+/** Auto-sync runs ask for at most this many conflicts; the rest batch keep-both. */
+const CONFLICT_PROMPT_LIMIT = 5;
+
 export interface SyncSummary {
   pushed: number;
   pulled: number;
   conflicts: number;
   /** IMP-1: conflicts resolved by the opt-in Markdown three-way merge. */
   merged: number;
+  /** IMP-2: conflicts the user chose to leave untouched for a later cycle. */
+  skipped: number;
   deletedLocal: number;
   deletedRemote: number;
   failures: Array<{ path: string; error: string }>;
@@ -201,6 +209,11 @@ export interface EngineContext {
    * engine builds SyncApi itself; specs inject a fake server transport.
    */
   createApi?(serverUrl: string, token: string): SyncApi;
+  /**
+   * IMP-2: ask the user how to resolve a conflicted file. Resolve with the
+   * choice, or null for "keep both" (Esc). Omitted => silent keep-both.
+   */
+  resolveConflict?(path: string): Promise<ConflictResolution | null>;
 }
 
 // ------------------------------------------------------------ pure planner --
@@ -379,6 +392,12 @@ export class SyncEngine {
   private lastIndexEtag = '';
   /** True while a password rotation is streaming re-encryption (PROB-1). */
   private rotating = false;
+  /** True while the current run was started explicitly by the user (IMP-2). */
+  private runInteractive = false;
+  /** Conflicts asked so far in the current run (IMP-2 batching rule). */
+  private conflictsAsked = 0;
+  /** Serializes conflict prompts — one modal at a time despite the pool. */
+  private conflictPromptChain: Promise<void> = Promise.resolve();
 
   /** Canonical paths we are writing ourselves; vault events for them are ignored. */
   private readonly ignorePaths = new Set<string>();
@@ -469,12 +488,14 @@ export class SyncEngine {
 
   // ------------------------------------------------------------ main cycle
 
-  async runFullSync(): Promise<SyncSummary | null> {
+  async runFullSync(interactive = false): Promise<SyncSummary | null> {
     if (this.running) {
       this.rerunRequested = true;
       return null;
     }
     this.running = true;
+    this.runInteractive = interactive;
+    this.conflictsAsked = 0;
     try {
       const settings = this.ctx.getSettings();
       const password = this.passwordOverride ?? settings.encryptionPassword;
@@ -493,7 +514,7 @@ export class SyncEngine {
       if (indexResult.notModified) {
         this.ctx.setStatus('synced');
         return {
-          pushed: 0, pulled: 0, conflicts: 0, merged: 0,
+          pushed: 0, pulled: 0, conflicts: 0, merged: 0, skipped: 0,
           deletedLocal: 0, deletedRemote: 0, failures: [],
         };
       }
@@ -540,12 +561,13 @@ export class SyncEngine {
       this.ctx.setStatus(summary.failures.length === 0 ? 'synced' : 'error',
         summary.failures.length === 0 ? undefined : `${summary.failures.length} file(s) failed`);
 
-      if (summary.conflicts > 0 || summary.merged > 0 || summary.failures.length > 0) {
+      if (summary.conflicts > 0 || summary.merged > 0 || summary.skipped > 0 || summary.failures.length > 0) {
         const parts = [
           `${summary.pushed} pushed`,
           `${summary.pulled} pulled`,
           `${summary.conflicts} conflicts`,
           ...(summary.merged > 0 ? [`${summary.merged} auto-merged`] : []),
+          ...(summary.skipped > 0 ? [`${summary.skipped} skipped`] : []),
           `${summary.deletedLocal + summary.deletedRemote} deletions`,
         ];
         this.ctx.notify(`E2EE Sync finished — ${parts.join(', ')}.`, 8000);
@@ -644,6 +666,7 @@ export class SyncEngine {
       pulled: 0,
       conflicts: 0,
       merged: 0,
+      skipped: 0,
       deletedLocal: 0,
       deletedRemote: 0,
       failures: [],
@@ -1057,6 +1080,54 @@ export class SyncEngine {
   }
 
   /**
+   * IMP-2: route a conflict to the user's choice. Auto-sync runs prompt for
+   * at most CONFLICT_PROMPT_LIMIT conflicts and batch keep-both for the rest
+   * (UI-storm guard); prompts are serialized so the upload pool can never
+   * stack two modals. Null (Esc) resolves to keep-both.
+   */
+  private askConflictResolution(path: string): Promise<ConflictResolution | null> {
+    const ask = this.ctx.resolveConflict;
+    if (!ask) return Promise.resolve('both');
+    if (!this.runInteractive && this.conflictsAsked >= CONFLICT_PROMPT_LIMIT) {
+      return Promise.resolve('both');
+    }
+    this.conflictsAsked++;
+    const run = this.conflictPromptChain.then(() => ask(path));
+    this.conflictPromptChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  /** IMP-2 "keep mine": overwrite the remote original with the local version. */
+  private async pushLocalOverRemote(
+    op: PlannedOp,
+    setup: SyncSetup,
+    summary: SyncSummary,
+    record: SyncRecord | undefined,
+  ): Promise<void> {
+    const local = this.ctx.app.vault.getAbstractFileByPath(op.local ? op.local.path : op.path);
+    if (!(local instanceof TFile)) return;
+    const plaintext = await this.ctx.app.vault.readBinary(local);
+    const version = Math.max(record?.remoteVersion ?? 0, op.remote?.ver ?? 0) + 1;
+    const uploaded = await this.encryptAndUpload(
+      setup, op.path, plaintext, local.stat.mtime, version,
+    );
+    const entry: SyncRecord = {
+      localMtime: local.stat.mtime,
+      remoteHash: uploaded.hash,
+      remoteMtime: uploaded.mtime,
+      remoteVersion: version,
+    };
+    this.setMergeBase(op.path, entry, plaintext);
+    this.ctx.setJournalEntry(op.path, entry);
+    this.markJournalDirty();
+    summary.pushed++;
+    this.ctx.notify(`Conflict in ${op.path} resolved: your version was kept.`, 6000);
+  }
+
+  /**
    * "Keep both" conflict resolution — ordered so a failure never leaves
    * duplicate debris and a retry is idempotent:
    *  1. upload the local version to <name>_conflict_<timestamp>.<ext> FIRST,
@@ -1064,6 +1135,7 @@ export class SyncEngine {
    *  3. download the remote version into the original path.
    * When the Markdown auto-merge (IMP-1) is enabled and produces a clean
    * three-way merge, the conflict resolves without any duplicate copy.
+   * With the interactive hook (IMP-2) the user picks the outcome instead.
    */
   private async doConflict(op: PlannedOp, setup: SyncSetup, summary: SyncSummary): Promise<void> {
     if (!op.local) return;
@@ -1074,6 +1146,25 @@ export class SyncEngine {
     if (this.mergeBaseEnabled()) {
       const merged = await this.tryMarkdownMerge(op, setup, summary, record);
       if (merged) return;
+    }
+
+    const choice = await this.askConflictResolution(op.path);
+    if (choice === 'skip') {
+      // Leave local and remote untouched; the conflict re-plans next cycle.
+      summary.skipped++;
+      this.ctx.notify(`Conflict in ${op.path} skipped — it will be offered again next sync.`, 6000);
+      return;
+    }
+    if (choice === 'mine') {
+      await this.pushLocalOverRemote(op, setup, summary, record);
+      return;
+    }
+    if (choice === 'remote') {
+      // The local edits are discarded (the modal says so up front).
+      // doPull journals and counts the pull itself.
+      await this.doPull({ ...op, local: undefined, remoteKey: op.remoteKey }, setup, summary);
+      this.ctx.notify(`Conflict in ${op.path} resolved: the server version was kept.`, 6000);
+      return;
     }
 
     const conflictPath = this.uniqueConflictPath(op.path);

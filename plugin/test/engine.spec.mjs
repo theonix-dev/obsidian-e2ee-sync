@@ -10,7 +10,7 @@
  * engine bundle sees — the executor instanceof-checks both).
  */
 
-import { finish, loadModule, ok, equal } from './harness.mjs';
+import { finish, loadModule, ok, equal, deepEqual } from './harness.mjs';
 
 const PASSWORD = 'engine-spec-password-0123456789';
 const VAULT_ID = 'engine-spec-vault-id-0123456789abcdef';
@@ -204,7 +204,7 @@ async function run() {
   // FakeServer's 404s to be recognized by the executor's instanceof checks.
   engine = engineMod;
   const { SyncEngine } = engineMod;
-  const { sha256Hex } = cryptoMod;
+  const { sha256Hex, CryptoManager, saltFromVaultId } = cryptoMod;
 
   const makeDevice = (name, vault, server, opts = {}) => {
     const journal = {};
@@ -234,6 +234,7 @@ async function run() {
       notify: (message) => notices.push(message),
       confirmMassDeletion: async () => true,
       createApi: () => server, // shared fake server = the network
+      resolveConflict: opts.resolveConflict,
     });
     return { name, engine: eng, vault, journal, notices, statuses, settings, getPersisted: () => persisted };
   };
@@ -252,6 +253,12 @@ async function run() {
   const utf8 = (s) => new TextEncoder().encode(s).buffer;
   const text = async (device, path) =>
     new TextDecoder().decode(await device.vault.readBinary(device.vault.getAbstractFileByPath(path)));
+  /** Server-side stored bytes are ciphertext — decrypt before asserting. */
+  const text0 = async (stored, path) => {
+    const cm = new CryptoManager(PASSWORD, await saltFromVaultId(VAULT_ID));
+    const { plaintext } = await cm.decrypt(stored.bytes.slice().buffer, path);
+    return new TextDecoder().decode(plaintext);
+  };
 
   console.log('[1] two-device push/pull round trip (real v3 crypto, verifier seeding)');
   {
@@ -386,6 +393,141 @@ async function run() {
     on.settings.enableMarkdownAutoMerge = false;
     await sync(on, 'A idle cycle with toggle off');
     ok(on.journal['note.md']?.basePlain === undefined, 'bases purged after the toggle goes off');
+  }
+
+  console.log('[6] IMP-2: interactive resolution — keep mine');
+  {
+    const server = new FakeServer(cryptoMod);
+    const a = makeDevice('A', new FakeVault(), server);
+    const asked = [];
+    const b = makeDevice('B', new FakeVault(), server, {
+      resolveConflict: async (path) => {
+        asked.push(path);
+        return 'mine';
+      },
+    });
+
+    await a.vault.createBinary('note.md', utf8('v1\n'));
+    await sync(a, 'A initial');
+    await sync(b, 'B initial pull');
+    await a.vault.modifyBinary(a.vault.getAbstractFileByPath('note.md'), utf8('server edit\n'));
+    await sync(a, 'A push v2');
+    await b.vault.modifyBinary(b.vault.getAbstractFileByPath('note.md'), utf8('my edit\n'));
+
+    const summary = await sync(b, 'B keep-mine cycle');
+    deepEqual(asked, ['note.md'], 'the modal was asked once for the conflicted path');
+    equal(summary?.pushed, 1, 'local version pushed');
+    equal(summary?.conflicts, 0, 'no keep-both duplication');
+    equal(await text(b, 'note.md'), 'my edit\n', 'local file untouched');
+    equal(await text0(server.files.get('note.md'), 'note.md'), 'my edit\n', 'remote now holds the local version');
+    equal(server.files.get('note.md')?.entry.ver, 3, 'version advanced to 3');
+
+    // A converges: pulls B's winning version.
+    await sync(a, 'A pull');
+    equal(await text(a, 'note.md'), 'my edit\n', 'A receives the kept version');
+  }
+
+  console.log('[7] IMP-2: interactive resolution — keep remote (local edits discarded)');
+  {
+    const server = new FakeServer(cryptoMod);
+    const a = makeDevice('A', new FakeVault(), server);
+    const b = makeDevice('B', new FakeVault(), server, { resolveConflict: async () => 'remote' });
+
+    await a.vault.createBinary('note.md', utf8('v1\n'));
+    await sync(a, 'A initial');
+    await sync(b, 'B initial pull');
+    await a.vault.modifyBinary(a.vault.getAbstractFileByPath('note.md'), utf8('server edit\n'));
+    await sync(a, 'A push v2');
+    await b.vault.modifyBinary(b.vault.getAbstractFileByPath('note.md'), utf8('my doomed edit\n'));
+
+    const summary = await sync(b, 'B keep-remote cycle');
+    equal(summary?.pulled, 1, 'remote version pulled');
+    equal(await text(b, 'note.md'), 'server edit\n', 'local file replaced by the server version');
+    equal(b.vault.getFiles().filter((f) => f.path.includes('_conflict_')).length, 0, 'no copies kept');
+  }
+
+  console.log('[8] IMP-2: skip leaves everything for the next cycle');
+  {
+    const server = new FakeServer(cryptoMod);
+    const a = makeDevice('A', new FakeVault(), server);
+    const b = makeDevice('B', new FakeVault(), server, { resolveConflict: async () => 'skip' });
+
+    await a.vault.createBinary('note.md', utf8('v1\n'));
+    await sync(a, 'A initial');
+    await sync(b, 'B initial pull');
+    await a.vault.modifyBinary(a.vault.getAbstractFileByPath('note.md'), utf8('server edit\n'));
+    await sync(a, 'A push v2');
+    await b.vault.modifyBinary(b.vault.getAbstractFileByPath('note.md'), utf8('my edit\n'));
+
+    const summary = await sync(b, 'B skip cycle');
+    equal(summary?.skipped, 1, 'skip counted');
+    equal(await text(b, 'note.md'), 'my edit\n', 'local file untouched');
+    equal(await text0(server.files.get('note.md'), 'note.md'), 'server edit\n', 'remote untouched');
+    // The conflict re-plans on the next cycle (still both sides changed).
+    const again = makeDevice('B2', b.vault, server, { resolveConflict: async () => 'both' });
+    // Reuse B's journal so the planner sees the same stale record.
+    for (const [k, v] of Object.entries(b.journal)) again.journal[k] = v;
+    const summary2 = await sync(again, 'next cycle re-plans the conflict');
+    equal(summary2?.conflicts, 1, 'conflict offered again and resolved as keep-both');
+  }
+
+  console.log('[9] IMP-2: auto-run batches keep-both after 5 prompts');
+  {
+    const server = new FakeServer(cryptoMod);
+    const a = makeDevice('A', new FakeVault(), server);
+    let asked = 0;
+    const b = makeDevice('B', new FakeVault(), server, {
+      resolveConflict: async () => {
+        asked++;
+        return 'both';
+      },
+    });
+
+    const N = 8;
+    for (let i = 0; i < N; i++) {
+      await a.vault.createBinary(`c${i}.md`, utf8(`v1-${i}\n`));
+    }
+    await sync(a, 'A initial 8 files');
+    await sync(b, 'B initial pull');
+
+    for (let i = 0; i < N; i++) {
+      await a.vault.modifyBinary(a.vault.getAbstractFileByPath(`c${i}.md`), utf8(`server-${i}\n`));
+      await b.vault.modifyBinary(b.vault.getAbstractFileByPath(`c${i}.md`), utf8(`local-${i}\n`));
+    }
+    await sync(a, 'A push all');
+    const summary = await sync(b, 'B auto-run with 8 conflicts');
+
+    equal(asked, 5, 'only the first 5 conflicts prompted (CONFLICT_PROMPT_LIMIT)');
+    equal(summary?.conflicts, 8, 'all 8 resolved as keep-both');
+    const copies = b.vault.getFiles().filter((f) => f.path.includes('_conflict_')).length;
+    equal(copies, 8, '8 conflict copies created');
+  }
+
+  console.log('[10] IMP-2: interactive run prompts for every conflict');
+  {
+    const server = new FakeServer(cryptoMod);
+    const a = makeDevice('A', new FakeVault(), server);
+    let asked = 0;
+    const b = makeDevice('B', new FakeVault(), server, {
+      resolveConflict: async () => {
+        asked++;
+        return 'skip';
+      },
+    });
+
+    for (let i = 0; i < 7; i++) {
+      await a.vault.createBinary(`d${i}.md`, utf8(`v1-${i}\n`));
+    }
+    await sync(a, 'A initial');
+    await sync(b, 'B initial pull');
+    for (let i = 0; i < 7; i++) {
+      await a.vault.modifyBinary(a.vault.getAbstractFileByPath(`d${i}.md`), utf8(`server-${i}\n`));
+      await b.vault.modifyBinary(b.vault.getAbstractFileByPath(`d${i}.md`), utf8(`local-${i}\n`));
+    }
+    await sync(a, 'A push all');
+    const summary = await b.engine.runFullSync(true); // interactive run
+    equal(asked, 7, 'interactive run prompts for every conflict');
+    equal(summary?.skipped, 7, 'all skipped by the user');
   }
 
   finish('engine.spec');

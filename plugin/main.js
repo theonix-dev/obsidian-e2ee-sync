@@ -969,6 +969,7 @@ function isSyncablePath(p, configDir) {
   }
   return true;
 }
+var CONFLICT_PROMPT_LIMIT = 5;
 function planSync(locals, remote, journal, configDir) {
   var _a;
   const ops = [];
@@ -1071,6 +1072,12 @@ var SyncEngine = class {
     this.lastIndexEtag = "";
     /** True while a password rotation is streaming re-encryption (PROB-1). */
     this.rotating = false;
+    /** True while the current run was started explicitly by the user (IMP-2). */
+    this.runInteractive = false;
+    /** Conflicts asked so far in the current run (IMP-2 batching rule). */
+    this.conflictsAsked = 0;
+    /** Serializes conflict prompts — one modal at a time despite the pool. */
+    this.conflictPromptChain = Promise.resolve();
     /** Canonical paths we are writing ourselves; vault events for them are ignored. */
     this.ignorePaths = /* @__PURE__ */ new Set();
     /** Per-path debounce timers, keyed by canonical path. */
@@ -1142,13 +1149,15 @@ var SyncEngine = class {
     });
   }
   // ------------------------------------------------------------ main cycle
-  async runFullSync() {
+  async runFullSync(interactive = false) {
     var _a, _b;
     if (this.running) {
       this.rerunRequested = true;
       return null;
     }
     this.running = true;
+    this.runInteractive = interactive;
+    this.conflictsAsked = 0;
     try {
       const settings = this.ctx.getSettings();
       const password = (_a = this.passwordOverride) != null ? _a : settings.encryptionPassword;
@@ -1166,6 +1175,7 @@ var SyncEngine = class {
           pulled: 0,
           conflicts: 0,
           merged: 0,
+          skipped: 0,
           deletedLocal: 0,
           deletedRemote: 0,
           failures: []
@@ -1198,12 +1208,13 @@ var SyncEngine = class {
         summary.failures.length === 0 ? "synced" : "error",
         summary.failures.length === 0 ? void 0 : `${summary.failures.length} file(s) failed`
       );
-      if (summary.conflicts > 0 || summary.merged > 0 || summary.failures.length > 0) {
+      if (summary.conflicts > 0 || summary.merged > 0 || summary.skipped > 0 || summary.failures.length > 0) {
         const parts = [
           `${summary.pushed} pushed`,
           `${summary.pulled} pulled`,
           `${summary.conflicts} conflicts`,
           ...summary.merged > 0 ? [`${summary.merged} auto-merged`] : [],
+          ...summary.skipped > 0 ? [`${summary.skipped} skipped`] : [],
           `${summary.deletedLocal + summary.deletedRemote} deletions`
         ];
         this.ctx.notify(`E2EE Sync finished \u2014 ${parts.join(", ")}.`, 8e3);
@@ -1292,6 +1303,7 @@ var SyncEngine = class {
       pulled: 0,
       conflicts: 0,
       merged: 0,
+      skipped: 0,
       deletedLocal: 0,
       deletedRemote: 0,
       failures: []
@@ -1625,6 +1637,52 @@ var SyncEngine = class {
     return true;
   }
   /**
+   * IMP-2: route a conflict to the user's choice. Auto-sync runs prompt for
+   * at most CONFLICT_PROMPT_LIMIT conflicts and batch keep-both for the rest
+   * (UI-storm guard); prompts are serialized so the upload pool can never
+   * stack two modals. Null (Esc) resolves to keep-both.
+   */
+  askConflictResolution(path) {
+    const ask = this.ctx.resolveConflict;
+    if (!ask) return Promise.resolve("both");
+    if (!this.runInteractive && this.conflictsAsked >= CONFLICT_PROMPT_LIMIT) {
+      return Promise.resolve("both");
+    }
+    this.conflictsAsked++;
+    const run = this.conflictPromptChain.then(() => ask(path));
+    this.conflictPromptChain = run.then(
+      () => void 0,
+      () => void 0
+    );
+    return run;
+  }
+  /** IMP-2 "keep mine": overwrite the remote original with the local version. */
+  async pushLocalOverRemote(op, setup, summary, record) {
+    var _a, _b, _c;
+    const local = this.ctx.app.vault.getAbstractFileByPath(op.local ? op.local.path : op.path);
+    if (!(local instanceof import_obsidian2.TFile)) return;
+    const plaintext = await this.ctx.app.vault.readBinary(local);
+    const version = Math.max((_a = record == null ? void 0 : record.remoteVersion) != null ? _a : 0, (_c = (_b = op.remote) == null ? void 0 : _b.ver) != null ? _c : 0) + 1;
+    const uploaded = await this.encryptAndUpload(
+      setup,
+      op.path,
+      plaintext,
+      local.stat.mtime,
+      version
+    );
+    const entry = {
+      localMtime: local.stat.mtime,
+      remoteHash: uploaded.hash,
+      remoteMtime: uploaded.mtime,
+      remoteVersion: version
+    };
+    this.setMergeBase(op.path, entry, plaintext);
+    this.ctx.setJournalEntry(op.path, entry);
+    this.markJournalDirty();
+    summary.pushed++;
+    this.ctx.notify(`Conflict in ${op.path} resolved: your version was kept.`, 6e3);
+  }
+  /**
    * "Keep both" conflict resolution — ordered so a failure never leaves
    * duplicate debris and a retry is idempotent:
    *  1. upload the local version to <name>_conflict_<timestamp>.<ext> FIRST,
@@ -1632,6 +1690,7 @@ var SyncEngine = class {
    *  3. download the remote version into the original path.
    * When the Markdown auto-merge (IMP-1) is enabled and produces a clean
    * three-way merge, the conflict resolves without any duplicate copy.
+   * With the interactive hook (IMP-2) the user picks the outcome instead.
    */
   async doConflict(op, setup, summary) {
     var _a;
@@ -1642,6 +1701,21 @@ var SyncEngine = class {
     if (this.mergeBaseEnabled()) {
       const merged = await this.tryMarkdownMerge(op, setup, summary, record);
       if (merged) return;
+    }
+    const choice = await this.askConflictResolution(op.path);
+    if (choice === "skip") {
+      summary.skipped++;
+      this.ctx.notify(`Conflict in ${op.path} skipped \u2014 it will be offered again next sync.`, 6e3);
+      return;
+    }
+    if (choice === "mine") {
+      await this.pushLocalOverRemote(op, setup, summary, record);
+      return;
+    }
+    if (choice === "remote") {
+      await this.doPull({ ...op, local: void 0, remoteKey: op.remoteKey }, setup, summary);
+      this.ctx.notify(`Conflict in ${op.path} resolved: the server version was kept.`, 6e3);
+      return;
     }
     const conflictPath = this.uniqueConflictPath(op.path);
     const localCopy = await this.ctx.app.vault.readBinary(local);
@@ -2454,6 +2528,47 @@ var IntegrityReportModal = class extends import_obsidian4.Modal {
     repair.onclick = () => done(true);
   }
 };
+var ConflictModal = class extends import_obsidian4.Modal {
+  constructor(app, path, onSubmit) {
+    super(app);
+    this.path = path;
+    this.onSubmit = onSubmit;
+  }
+  onOpen() {
+    let settled = false;
+    const settle = (value) => {
+      if (!settled) {
+        settled = true;
+        this.onSubmit(value);
+      }
+    };
+    this.titleEl.setText("E2EE Sync: conflict");
+    this.contentEl.createEl("p", {
+      text: `This device and the server both changed "${this.path}". Choose which version to keep \u2014 the other one will not survive this choice.`
+    });
+    const row = this.contentEl.createEl("div", { cls: "modal-button-container" });
+    const button = (text, cls, choice, confirm = false) => {
+      const b = row.createEl("button", { text, cls: confirm ? "mod-cta" : cls });
+      b.onclick = () => {
+        settle(choice);
+        this.close();
+      };
+      return b;
+    };
+    button("Keep mine", "", "mine");
+    button("Keep remote", "", "remote");
+    button("Keep both", "", "both", true);
+    button("Skip", "", "skip");
+    this.contentEl.createEl("p", {
+      text: '"Keep mine" uploads your version (the server copy is replaced). "Keep remote" discards your local edits. "Keep both" saves your version as a _conflict_ copy. "Skip" decides nothing and asks again on the next sync.',
+      cls: "setting-item-description"
+    });
+  }
+  onClose() {
+    this.onSubmit(null);
+    super.onClose();
+  }
+};
 var E2eeSyncPlugin = class extends import_obsidian4.Plugin {
   constructor() {
     super(...arguments);
@@ -2502,7 +2617,10 @@ var E2eeSyncPlugin = class extends import_obsidian4.Plugin {
         `The server reports ${deletedCount} of your ${localCount} files as deleted. This can mean another device cleaned the vault \u2014 or that the server (or API token) was compromised. "Keep my local files" cancels these deletions; the kept files are re-uploaded on the next sync, so nothing is lost either way.`,
         "Delete as instructed"
       ),
-      promptPassword: (reason) => this.promptForChangedPassword(reason)
+      promptPassword: (reason) => this.promptForChangedPassword(reason),
+      resolveConflict: (path) => new Promise((resolve) => {
+        new ConflictModal(this.app, path, resolve).open();
+      })
     });
     this.addSettingTab(new E2eeSyncSettingTab(this.app, this));
     this.ribbonEl = this.addRibbonIcon("refresh-cw", "E2EE Sync: sync now", () => {
@@ -2641,7 +2759,7 @@ var E2eeSyncPlugin = class extends import_obsidian4.Plugin {
       this.promptForSessionPassword();
       return;
     }
-    void this.engine.runFullSync();
+    void this.engine.runFullSync(true);
   }
   /** PROB-10: verify every remote entry (hash + decryptability), offer repair. */
   async runIntegrityCheck() {

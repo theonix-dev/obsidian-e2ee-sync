@@ -11,6 +11,7 @@
 import { Modal, Notice, Plugin, TFile, setIcon } from 'obsidian';
 import type { App } from 'obsidian';
 import { SyncEngine, canonicalPath } from './syncEngine';
+import type { ConflictResolution } from './syncEngine';
 import { E2eeSyncSettingTab } from './settings';
 import { DEFAULT_SETTINGS } from './types';
 import type { PluginData, PluginSettings, SyncRecord, SyncStatus } from './types';
@@ -144,6 +145,57 @@ class IntegrityReportModal extends Modal {
   }
 }
 
+/** IMP-2: per-conflict decision modal. Esc/backdrop = keep both (old default). */
+class ConflictModal extends Modal {
+  constructor(
+    app: App,
+    private readonly path: string,
+    private readonly onSubmit: (choice: ConflictResolution | null) => void,
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    let settled = false;
+    const settle = (value: ConflictResolution | null) => {
+      if (!settled) {
+        settled = true;
+        this.onSubmit(value);
+      }
+    };
+    this.titleEl.setText('E2EE Sync: conflict');
+    this.contentEl.createEl('p', {
+      text:
+        `This device and the server both changed "${this.path}". ` +
+        'Choose which version to keep — the other one will not survive this choice.',
+    });
+    const row = this.contentEl.createEl('div', { cls: 'modal-button-container' });
+    const button = (text: string, cls: string, choice: ConflictResolution | null, confirm = false) => {
+      const b = row.createEl('button', { text, cls: confirm ? 'mod-cta' : cls });
+      b.onclick = () => {
+        settle(choice);
+        this.close();
+      };
+      return b;
+    };
+    button('Keep mine', '', 'mine');
+    button('Keep remote', '', 'remote');
+    button('Keep both', '', 'both', true);
+    button('Skip', '', 'skip');
+    this.contentEl.createEl('p', {
+      text: '"Keep mine" uploads your version (the server copy is replaced). "Keep remote" discards ' +
+        'your local edits. "Keep both" saves your version as a _conflict_ copy. "Skip" decides nothing ' +
+        'and asks again on the next sync.',
+      cls: 'setting-item-description',
+    });
+  }
+
+  onClose(): void {
+    this.onSubmit(null); // settled guard in onSubmit's owner maps null to keep-both
+    super.onClose();
+  }
+}
+
 export default class E2eeSyncPlugin extends Plugin {
   settings: PluginSettings = { ...DEFAULT_SETTINGS };
   journal: Record<string, SyncRecord> = {};
@@ -205,6 +257,10 @@ export default class E2eeSyncPlugin extends Plugin {
           'Delete as instructed',
         ),
       promptPassword: (reason) => this.promptForChangedPassword(reason),
+      resolveConflict: (path) =>
+        new Promise<ConflictResolution | null>((resolve) => {
+          new ConflictModal(this.app, path, resolve).open();
+        }),
     });
 
     this.addSettingTab(new E2eeSyncSettingTab(this.app, this));
@@ -372,7 +428,8 @@ export default class E2eeSyncPlugin extends Plugin {
       this.promptForSessionPassword();
       return;
     }
-    void this.engine.runFullSync();
+    // Interactive run: conflict modals are allowed without the batch limit.
+    void this.engine.runFullSync(true);
   }
 
   /** PROB-10: verify every remote entry (hash + decryptability), offer repair. */
