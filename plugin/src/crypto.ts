@@ -58,7 +58,6 @@ const MANIFEST_BYTES = 32;
 
 /** v1 packet: header + empty plaintext + 16-byte GCM auth tag. */
 const PACKET_V1_BYTES = SALT_BYTES + IV_BYTES + 16;
-const PACKET_V1 = 0x01; // documentation only — v1 has no version byte
 /** Version byte introduced with AAD binding (v2 packets). */
 const PACKET_V2 = 0x02;
 /** v2 packet: version byte + header + empty plaintext + tag. */

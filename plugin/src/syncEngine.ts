@@ -152,11 +152,11 @@ export function isSyncablePath(p: string, configDir: string, ignores?: IgnoreMat
 }
 
 /**
- * IMP-6 — allowlist for one path relative to the configuration folder
- * (.obsidian/). Only known groups sync at all; the device-local,
- * dangerous-to-propagate entries (plugins/<id>/data.json, workspace.json) are
- * opt-in per checkbox; anything unrecognized (unknown plugin files, random
- * hidden files) never syncs.
+ * IMP-6 — allowlist for one path relative to the hidden configuration folder
+ * (the one Vault#configDir points to). Only known groups sync at all; the
+ * device-local, dangerous-to-propagate entries (plugins/<id>/data.json,
+ * workspace.json) are opt-in per checkbox; anything unrecognized (unknown
+ * plugin files, random hidden files) never syncs.
  */
 export function isConfigSyncablePath(rest: string, allow: ConfigSyncSettings): boolean {
   if (!allow.enabled) return false;
@@ -225,7 +225,7 @@ interface PlannedOp {
   remoteKey?: string;
   /** IMP-6: true for ops of the config/ namespace (separate journal section). */
   config?: boolean;
-  /** IMP-6: vault-relative path for config ops (path under .obsidian/). */
+  /** IMP-6: vault-relative path for config ops (under the config folder). */
   localPath?: string;
   local?: FileStatLike;
   remote?: RemoteFileInfo;
@@ -560,7 +560,7 @@ export class SyncEngine {
 
   /**
    * Plan the hidden-configuration namespace: locals are the allowlisted files
-   * under .obsidian/ mapped to their config/ server paths; the remote subset
+   * the config folder, mapped to their config/ server paths; the remote subset
    * is everything with the config/ prefix; the journal is the separate
    * section. With `emptyLocals` (restore) every live entry plans a pull.
    */
@@ -2076,7 +2076,6 @@ export class SyncEngine {
     // 2. Classify the vault from the index.
     const otherVerifiers: string[] = [];
     let liveForeign = 0;
-    let liveFiles = 0;
     for (const [p, f] of Object.entries(index.files)) {
       if (!f) continue;
       const canon = canonicalPath(p);
@@ -2084,10 +2083,7 @@ export class SyncEngine {
         if (canon !== ourPath) otherVerifiers.push(canon);
         continue;
       }
-      if (!f.deleted) {
-        liveFiles++;
-        if (f.keyId && f.keyId !== setup.keyIdHex) liveForeign++;
-      }
+      if (!f.deleted && f.keyId && f.keyId !== setup.keyIdHex) liveForeign++;
     }
 
     // 3. Verifiers for unknown keys / foreign-keyed files -> the password was

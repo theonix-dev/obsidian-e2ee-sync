@@ -70,9 +70,9 @@ export interface SyncRecord {
 export type SyncStatus = 'idle' | 'syncing' | 'synced' | 'error' | 'offline';
 
 /**
- * IMP-6: per-group allowlist of the hidden configuration folder
- * (.obsidian/). Device-local, dangerous-to-propagate entries are excluded by
- * default; everything outside the known groups never syncs.
+ * IMP-6: per-group allowlist for the hidden configuration folder (the one
+ * Vault#configDir points to). Device-local, dangerous-to-propagate entries
+ * are excluded by default; everything outside the known groups never syncs.
  */
 export interface ConfigSyncSettings {
   /** Master switch — off by default. */
@@ -133,7 +133,7 @@ export interface PluginSettings {
    * sync. Merged with the vault-root `.syncignore` file at every cycle.
    */
   ignorePatterns: string;
-  /** IMP-6: hidden-configuration (.obsidian/) sync groups. */
+  /** IMP-6: hidden-configuration (Vault#configDir) sync groups. */
   configSync: ConfigSyncSettings;
   /**
    * IMP-8: skip automatic syncs while the device reports a metered

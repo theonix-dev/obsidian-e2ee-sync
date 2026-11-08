@@ -1354,7 +1354,7 @@ var _SyncEngine = class _SyncEngine {
   }
   /**
    * Plan the hidden-configuration namespace: locals are the allowlisted files
-   * under .obsidian/ mapped to their config/ server paths; the remote subset
+   * the config folder, mapped to their config/ server paths; the remote subset
    * is everything with the config/ prefix; the journal is the separate
    * section. With `emptyLocals` (restore) every live entry plans a pull.
    */
@@ -2636,7 +2636,6 @@ Both versions kept \u2014 local copy saved as: ${conflictLocal}`,
     if (await decrypts(ourPath) === "yes") return;
     const otherVerifiers = [];
     let liveForeign = 0;
-    let liveFiles = 0;
     for (const [p, f] of Object.entries(index.files)) {
       if (!f) continue;
       const canon = canonicalPath(p);
@@ -2644,10 +2643,7 @@ Both versions kept \u2014 local copy saved as: ${conflictLocal}`,
         if (canon !== ourPath) otherVerifiers.push(canon);
         continue;
       }
-      if (!f.deleted) {
-        liveFiles++;
-        if (f.keyId && f.keyId !== setup.keyIdHex) liveForeign++;
-      }
+      if (!f.deleted && f.keyId && f.keyId !== setup.keyIdHex) liveForeign++;
     }
     if (otherVerifiers.length > 0 || liveForeign > 0) {
       throw new CryptoError(
@@ -2786,7 +2782,6 @@ var E2eeSyncSettingTab = class extends import_obsidian3.PluginSettingTab {
     this.plugin = plugin;
   }
   getSettingDefinitions() {
-    const plugin = this.plugin;
     return [
       {
         type: "group",
@@ -2866,7 +2861,7 @@ var E2eeSyncSettingTab = class extends import_obsidian3.PluginSettingTab {
           },
           {
             name: "Sync hidden configuration (experimental)",
-            desc: 'Syncs allowlisted files from the .obsidian folder through a separate "config/" namespace (same encryption, separate journal section). Default groups: appearance.json, app.json, hotkeys.json, snippets/, themes/ and plugin code (main.js, manifest.json, styles.css). plugins/<id>/data.json and workspace.json stay device-local unless you opt in \u2014 they can propagate secrets or per-device UI state between machines.',
+            desc: 'Syncs allowlisted files from the vault\u2019s configuration folder (the folder Vault#configDir points to \u2014 not a hardcoded name) through a separate "config/" namespace (same encryption, separate journal section). Default groups: appearance.json, app.json, hotkeys.json, snippets/, themes/ and plugin code (main.js, manifest.json, styles.css). plugins/<id>/data.json and workspace.json stay device-local unless you opt in \u2014 they can propagate secrets or per-device UI state between machines.',
             control: {
               type: "toggle",
               key: "configSync.enabled"
@@ -3138,7 +3133,7 @@ var IntegrityReportModal = class extends import_obsidian4.Modal {
     this.contentEl.createEl("p", {
       text: "Repair re-uploads the intact local copy of every affected file (version history advances by one). Files without a healthy local copy are skipped."
     });
-    const row = this.contentEl.createEl("div", { cls: "modal-button-container" });
+    const row = this.contentEl.createDiv({ cls: "modal-button-container" });
     const close = row.createEl("button", { text: "Close" });
     const repair = row.createEl("button", { text: "Repair from local copies", cls: "mod-warning" });
     const done = (value) => {
@@ -3167,7 +3162,7 @@ var ConflictModal = class extends import_obsidian4.Modal {
     this.contentEl.createEl("p", {
       text: `This device and the server both changed "${this.path}". Choose which version to keep \u2014 the other one will not survive this choice.`
     });
-    const row = this.contentEl.createEl("div", { cls: "modal-button-container" });
+    const row = this.contentEl.createDiv({ cls: "modal-button-container" });
     const button = (text, cls, choice, confirm = false) => {
       const b = row.createEl("button", { text, cls: confirm ? "mod-cta" : cls });
       b.onclick = () => {
@@ -3366,7 +3361,7 @@ var E2eeSyncPlugin = class extends import_obsidian4.Plugin {
           });
           const input = this.contentEl.createEl("input", { type: "password" });
           input.placeholder = "Current E2EE password";
-          const row = this.contentEl.createEl("div", { cls: "modal-button-container" });
+          const row = this.contentEl.createDiv({ cls: "modal-button-container" });
           const cancel = row.createEl("button", { text: "Not now" });
           const unlock = row.createEl("button", { text: "Unlock sync", cls: "mod-cta" });
           const submit = () => {

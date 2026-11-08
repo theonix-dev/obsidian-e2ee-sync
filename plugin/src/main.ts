@@ -135,7 +135,7 @@ class IntegrityReportModal extends Modal {
         'Repair re-uploads the intact local copy of every affected file (version history ' +
         'advances by one). Files without a healthy local copy are skipped.',
     });
-    const row = this.contentEl.createEl('div', { cls: 'modal-button-container' });
+    const row = this.contentEl.createDiv({ cls: 'modal-button-container' });
     const close = row.createEl('button', { text: 'Close' });
     const repair = row.createEl('button', { text: 'Repair from local copies', cls: 'mod-warning' });
     const done = (value: boolean) => {
@@ -171,7 +171,7 @@ class ConflictModal extends Modal {
         `This device and the server both changed "${this.path}". ` +
         'Choose which version to keep — the other one will not survive this choice.',
     });
-    const row = this.contentEl.createEl('div', { cls: 'modal-button-container' });
+    const row = this.contentEl.createDiv({ cls: 'modal-button-container' });
     const button = (text: string, cls: string, choice: ConflictResolution | null, confirm = false) => {
       const b = row.createEl('button', { text, cls: confirm ? 'mod-cta' : cls });
       b.onclick = () => {
@@ -415,7 +415,7 @@ export default class E2eeSyncPlugin extends Plugin {
           });
           const input = this.contentEl.createEl('input', { type: 'password' });
           input.placeholder = 'Current E2EE password';
-          const row = this.contentEl.createEl('div', { cls: 'modal-button-container' });
+          const row = this.contentEl.createDiv({ cls: 'modal-button-container' });
           const cancel = row.createEl('button', { text: 'Not now' });
           const unlock = row.createEl('button', { text: 'Unlock sync', cls: 'mod-cta' });
           const submit = () => {

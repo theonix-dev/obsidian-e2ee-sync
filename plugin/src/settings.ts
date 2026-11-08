@@ -25,7 +25,6 @@ export class E2eeSyncSettingTab extends PluginSettingTab {
   }
 
   getSettingDefinitions(): SettingDefinitionItem[] {
-    const plugin = this.plugin;
     return [
       {
         type: 'group',
@@ -119,7 +118,8 @@ export class E2eeSyncSettingTab extends PluginSettingTab {
           {
             name: 'Sync hidden configuration (experimental)',
             desc:
-              'Syncs allowlisted files from the .obsidian folder through a separate "config/" namespace ' +
+              'Syncs allowlisted files from the vault\u2019s configuration folder (the folder ' +
+              'Vault#configDir points to \u2014 not a hardcoded name) through a separate "config/" namespace ' +
               '(same encryption, separate journal section). Default groups: appearance.json, app.json, ' +
               'hotkeys.json, snippets/, themes/ and plugin code (main.js, manifest.json, styles.css). ' +
               'plugins/<id>/data.json and workspace.json stay device-local unless you opt in — they can ' +
