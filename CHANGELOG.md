@@ -4,10 +4,10 @@ All notable changes to this project are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.3.5] — 2026-11-08
 
-Roadmap Section B (improvements register) — see `docs/ROADMAP.md`. Implemented
-on `beta`; no release has been cut from this branch.
+Roadmap Section B (improvements register) — see `docs/ROADMAP.md`. Developed
+on `beta`; tagged on `main` per the standing rules.
 
 ### Added
 
