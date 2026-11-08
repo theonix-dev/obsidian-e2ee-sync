@@ -171,6 +171,18 @@ export class E2eeSyncSettingTab extends PluginSettingTab {
             control: { type: 'toggle', key: 'configSync.workspace' },
           },
           {
+            name: 'Sync only on Wi-Fi (skip metered)',
+            desc:
+              'Skips automatic syncs while the device reports a metered connection (cellular, or the ' +
+              'OS Data Saver enabled). Manual syncs always run. Platform support: Android’s WebView ' +
+              'reports the connection type; iOS does not expose it at all — there this toggle has no ' +
+              'effect and sync proceeds (the plugin will not pretend to know).',
+            control: {
+              type: 'toggle',
+              key: 'wifiOnly',
+            },
+          },
+          {
             name: 'Test connection',
             desc: 'Checks reachability, the API token and key derivation (GET /api/index).',
             action: () => {

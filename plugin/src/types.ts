@@ -135,6 +135,12 @@ export interface PluginSettings {
   ignorePatterns: string;
   /** IMP-6: hidden-configuration (.obsidian/) sync groups. */
   configSync: ConfigSyncSettings;
+  /**
+   * IMP-8: skip automatic syncs while the device reports a metered
+   * connection. Only effective where the platform exposes a trustworthy
+   * connection type (Android WebView); iOS does not and is never blocked.
+   */
+  wifiOnly: boolean;
 }
 
 export const DEFAULT_SETTINGS: PluginSettings = {
@@ -146,6 +152,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   enableMarkdownAutoMerge: false,
   ignorePatterns: '',
   configSync: DEFAULT_CONFIG_SYNC,
+  wifiOnly: false,
 };
 
 /** Shape of the plugin's persisted data.json. */

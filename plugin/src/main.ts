@@ -12,6 +12,7 @@ import { Modal, Notice, Plugin, TFile, setIcon } from 'obsidian';
 import type { App } from 'obsidian';
 import { SyncEngine, canonicalPath } from './syncEngine';
 import type { ConflictResolution } from './syncEngine';
+import { currentConnectionInfo, isAutoSyncAllowed } from './connection';
 import { E2eeSyncSettingTab } from './settings';
 import { DEFAULT_CONFIG_SYNC, DEFAULT_SETTINGS } from './types';
 import type { PluginData, PluginSettings, SyncRecord, SyncStatus } from './types';
@@ -547,10 +548,23 @@ export default class E2eeSyncPlugin extends Plugin {
     }
     const m = Math.min(Math.max(Math.floor(minutes), 0), 1440);
     if (m <= 0 || !this.isConfigured()) return;
-    this.autoSyncTimer = window.setInterval(
-      () => this.engine.requestSync(),
-      m * 60_000,
-    );
+    this.autoSyncTimer = window.setInterval(() => {
+      if (!this.isAutoSyncAllowedNow()) return;
+      this.engine.requestSync();
+    }, m * 60_000);
+  }
+
+  /**
+   * IMP-8 gate for non-manual syncs (periodic timer, startup sync). Manual
+   * syncs bypass it — the user asked explicitly. When the platform exposes
+   * no connection type the gate never blocks (documented, not guessed).
+   */
+  private isAutoSyncAllowedNow(): boolean {
+    const allowed = isAutoSyncAllowed(this.settings.wifiOnly, currentConnectionInfo());
+    if (!allowed) {
+      this.updateStatus('offline', 'auto-sync skipped — metered connection (Wi-Fi only is on)');
+    }
+    return allowed;
   }
 
   private isConfigured(): boolean {
@@ -589,6 +603,7 @@ export default class E2eeSyncPlugin extends Plugin {
       this.setAutoSync(this.settings.autoSyncMinutes);
       const timer = window.setTimeout(() => {
         this.oneShotTimers.delete(timer);
+        if (!this.isAutoSyncAllowedNow()) return;
         this.engine.requestSync();
       }, STARTUP_SYNC_DELAY_MS);
       this.oneShotTimers.add(timer);

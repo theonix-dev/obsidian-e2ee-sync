@@ -2748,6 +2748,35 @@ Both versions kept \u2014 local copy saved as: ${conflictLocal}`,
 _SyncEngine.CONFIG_PREFIX = "config/";
 var SyncEngine = _SyncEngine;
 
+// src/connection.ts
+var UNMETERED_TYPES = /* @__PURE__ */ new Set(["wifi", "ethernet"]);
+var METERED_TYPES = /* @__PURE__ */ new Set(["cellular"]);
+function readConnectionInfo(nav) {
+  var _a;
+  const conn = nav == null ? void 0 : nav.connection;
+  if (!conn) return { supported: false, metered: false, source: "none" };
+  const type = String((_a = conn.type) != null ? _a : "").toLowerCase();
+  if (UNMETERED_TYPES.has(type)) {
+    return { supported: true, metered: false, source: "type" };
+  }
+  if (METERED_TYPES.has(type)) {
+    return { supported: true, metered: true, source: "type" };
+  }
+  if (conn.saveData === true) {
+    return { supported: true, metered: true, source: "saveData" };
+  }
+  return { supported: false, metered: false, source: "none" };
+}
+function currentConnectionInfo() {
+  const nav = typeof navigator !== "undefined" ? navigator : void 0;
+  return readConnectionInfo(nav);
+}
+function isAutoSyncAllowed(wifiOnly, info) {
+  if (!wifiOnly) return true;
+  if (!info.supported) return true;
+  return !info.metered;
+}
+
 // src/settings.ts
 var import_obsidian3 = require("obsidian");
 var INTRO_TEXT = "Files are encrypted on this device (AES-256-GCM, PBKDF2-derived key) before they are uploaded. The server only ever stores ciphertext. File contents never leave this device unencrypted \u2014 but note that file paths, sizes and timestamps are visible to the server.";
@@ -2884,6 +2913,14 @@ var E2eeSyncSettingTab = class extends import_obsidian3.PluginSettingTab {
             control: { type: "toggle", key: "configSync.workspace" }
           },
           {
+            name: "Sync only on Wi-Fi (skip metered)",
+            desc: "Skips automatic syncs while the device reports a metered connection (cellular, or the OS Data Saver enabled). Manual syncs always run. Platform support: Android\u2019s WebView reports the connection type; iOS does not expose it at all \u2014 there this toggle has no effect and sync proceeds (the plugin will not pretend to know).",
+            control: {
+              type: "toggle",
+              key: "wifiOnly"
+            }
+          },
+          {
             name: "Test connection",
             desc: "Checks reachability, the API token and key derivation (GET /api/index).",
             action: () => {
@@ -2997,7 +3034,8 @@ var DEFAULT_SETTINGS = {
   rememberEncryptionPassword: true,
   enableMarkdownAutoMerge: false,
   ignorePatterns: "",
-  configSync: DEFAULT_CONFIG_SYNC
+  configSync: DEFAULT_CONFIG_SYNC,
+  wifiOnly: false
 };
 
 // src/main.ts
@@ -3447,10 +3485,22 @@ var E2eeSyncPlugin = class extends import_obsidian4.Plugin {
     }
     const m = Math.min(Math.max(Math.floor(minutes), 0), 1440);
     if (m <= 0 || !this.isConfigured()) return;
-    this.autoSyncTimer = window.setInterval(
-      () => this.engine.requestSync(),
-      m * 6e4
-    );
+    this.autoSyncTimer = window.setInterval(() => {
+      if (!this.isAutoSyncAllowedNow()) return;
+      this.engine.requestSync();
+    }, m * 6e4);
+  }
+  /**
+   * IMP-8 gate for non-manual syncs (periodic timer, startup sync). Manual
+   * syncs bypass it — the user asked explicitly. When the platform exposes
+   * no connection type the gate never blocks (documented, not guessed).
+   */
+  isAutoSyncAllowedNow() {
+    const allowed = isAutoSyncAllowed(this.settings.wifiOnly, currentConnectionInfo());
+    if (!allowed) {
+      this.updateStatus("offline", "auto-sync skipped \u2014 metered connection (Wi-Fi only is on)");
+    }
+    return allowed;
   }
   isConfigured() {
     const s = this.settings;
@@ -3485,6 +3535,7 @@ var E2eeSyncPlugin = class extends import_obsidian4.Plugin {
       this.setAutoSync(this.settings.autoSyncMinutes);
       const timer = window.setTimeout(() => {
         this.oneShotTimers.delete(timer);
+        if (!this.isAutoSyncAllowedNow()) return;
         this.engine.requestSync();
       }, STARTUP_SYNC_DELAY_MS);
       this.oneShotTimers.add(timer);
