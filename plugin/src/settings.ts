@@ -272,13 +272,14 @@ export class E2eeSyncSettingTab extends PluginSettingTab {
   private async runConnectionTest(): Promise<void> {
     const s = this.plugin.settings;
     try {
-      if (!s.serverUrl || !s.apiToken) {
+      const apiToken = this.plugin.effectiveApiToken;
+      if (!s.serverUrl || !apiToken) {
         throw new Error('Enter the server URL and API token first.');
       }
       const problem = validateServerUrl(s.serverUrl);
       if (problem) new Notice(`⚠️ ${problem}`, 6000);
 
-      const api = new SyncApi(s.serverUrl, s.apiToken);
+      const api = new SyncApi(s.serverUrl, apiToken);
       const result = await api.testConnection();
 
       // Sanity-check that Web Crypto + PBKDF2 work on this device.

@@ -17,6 +17,7 @@ server/*.tmp
 
 # Docker compose secrets (contains AUTH_TOKEN)
 .env
+CREDENTIALS.md
 
 # Local server data backups produced by `make backup`
 backups/

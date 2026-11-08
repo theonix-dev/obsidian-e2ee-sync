@@ -2991,12 +2991,13 @@ var E2eeSyncSettingTab = class extends import_obsidian3.PluginSettingTab {
   async runConnectionTest() {
     const s = this.plugin.settings;
     try {
-      if (!s.serverUrl || !s.apiToken) {
+      const apiToken = this.plugin.effectiveApiToken;
+      if (!s.serverUrl || !apiToken) {
         throw new Error("Enter the server URL and API token first.");
       }
       const problem = validateServerUrl(s.serverUrl);
       if (problem) new import_obsidian3.Notice(`\u26A0\uFE0F ${problem}`, 6e3);
-      const api = new SyncApi(s.serverUrl, s.apiToken);
+      const api = new SyncApi(s.serverUrl, apiToken);
       const result = await api.testConnection();
       await deriveKey("probe", await saltFromVaultId(result.vaultId), 1e3);
       new import_obsidian3.Notice(
@@ -3200,9 +3201,19 @@ var E2eeSyncPlugin = class extends import_obsidian4.Plugin {
     this.oneShotTimers = /* @__PURE__ */ new Set();
     this.lastErrorNotice = "";
   }
+  /** Resolve secret reference through Obsidian's SecretStorage, or return plain value if not stored. */
+  resolveSecret(val) {
+    var _a, _b;
+    if (!val) return "";
+    return (_b = (_a = this.app.secretStorage) == null ? void 0 : _a.getSecret(val)) != null ? _b : val;
+  }
+  get effectiveApiToken() {
+    return this.resolveSecret(this.settings.apiToken);
+  }
   /** The password in force right now: persisted value or the session value. */
   get effectivePassword() {
-    return this.settings.rememberEncryptionPassword ? this.settings.encryptionPassword : this.sessionPassword;
+    const raw = this.settings.rememberEncryptionPassword ? this.settings.encryptionPassword : this.sessionPassword;
+    return this.resolveSecret(raw);
   }
   async onload() {
     var _a, _b, _c, _d, _e, _f, _g;
@@ -3226,7 +3237,11 @@ var E2eeSyncPlugin = class extends import_obsidian4.Plugin {
     }
     this.engine = new SyncEngine({
       app: this.app,
-      getSettings: () => ({ ...this.settings, encryptionPassword: this.effectivePassword }),
+      getSettings: () => ({
+        ...this.settings,
+        apiToken: this.effectiveApiToken,
+        encryptionPassword: this.effectivePassword
+      }),
       getJournal: () => this.journal,
       setJournalEntry: (path, record) => {
         if (record) this.journal[path] = record;
@@ -3306,7 +3321,7 @@ var E2eeSyncPlugin = class extends import_obsidian4.Plugin {
    */
   async onEncryptionPasswordChanged(oldPassword) {
     const newPassword = this.effectivePassword;
-    if (!oldPassword || oldPassword === newPassword) {
+    if (!oldPassword || oldPassword === newPassword || Object.keys(this.journal).length === 0) {
       await this.saveSettings();
       return;
     }
@@ -3386,7 +3401,7 @@ var E2eeSyncPlugin = class extends import_obsidian4.Plugin {
   }
   // ------------------------------------------------------------- syncing
   requestManualSync() {
-    if (!this.settings.serverUrl || !this.settings.apiToken) {
+    if (!this.settings.serverUrl || !this.effectiveApiToken) {
       new import_obsidian4.Notice("E2EE Sync: set the server URL and API token in the plugin settings first.", 6e3);
       return;
     }
@@ -3398,7 +3413,7 @@ var E2eeSyncPlugin = class extends import_obsidian4.Plugin {
   }
   /** PROB-10: verify every remote entry (hash + decryptability), offer repair. */
   async runIntegrityCheck() {
-    if (!this.settings.serverUrl || !this.settings.apiToken || !this.effectivePassword) {
+    if (!this.settings.serverUrl || !this.effectiveApiToken || !this.effectivePassword) {
       new import_obsidian4.Notice("E2EE Sync: configure the plugin before verifying integrity.", 6e3);
       return;
     }
@@ -3453,7 +3468,7 @@ var E2eeSyncPlugin = class extends import_obsidian4.Plugin {
    * every live file. The engine reports the dry-run count into the dialog.
    */
   async runRestoreFromServer() {
-    if (!this.settings.serverUrl || !this.settings.apiToken || !this.effectivePassword) {
+    if (!this.settings.serverUrl || !this.effectiveApiToken || !this.effectivePassword) {
       new import_obsidian4.Notice("E2EE Sync: configure the plugin before restoring.", 6e3);
       return;
     }
@@ -3499,7 +3514,7 @@ var E2eeSyncPlugin = class extends import_obsidian4.Plugin {
   }
   isConfigured() {
     const s = this.settings;
-    return Boolean(s.serverUrl && s.apiToken && this.effectivePassword);
+    return Boolean(s.serverUrl && this.effectiveApiToken && this.effectivePassword);
   }
   onLayoutReady() {
     this.registerEvent(
@@ -3522,7 +3537,7 @@ var E2eeSyncPlugin = class extends import_obsidian4.Plugin {
         if (file instanceof import_obsidian4.TFile) this.engine.onLocalRenamed(oldPath, file.path);
       })
     );
-    if (this.settings.serverUrl && this.settings.apiToken) {
+    if (this.settings.serverUrl && this.effectiveApiToken) {
       if (!this.effectivePassword && !this.settings.rememberEncryptionPassword) {
         this.promptForSessionPassword();
         return;

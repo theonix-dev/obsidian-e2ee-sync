@@ -214,11 +214,22 @@ export default class E2eeSyncPlugin extends Plugin {
   private readonly oneShotTimers = new Set<number>();
   private lastErrorNotice = '';
 
+  /** Resolve secret reference through Obsidian's SecretStorage, or return plain value if not stored. */
+  resolveSecret(val: string): string {
+    if (!val) return '';
+    return this.app.secretStorage?.getSecret(val) ?? val;
+  }
+
+  get effectiveApiToken(): string {
+    return this.resolveSecret(this.settings.apiToken);
+  }
+
   /** The password in force right now: persisted value or the session value. */
   get effectivePassword(): string {
-    return this.settings.rememberEncryptionPassword
+    const raw = this.settings.rememberEncryptionPassword
       ? this.settings.encryptionPassword
       : this.sessionPassword;
+    return this.resolveSecret(raw);
   }
 
   async onload(): Promise<void> {
@@ -247,7 +258,11 @@ export default class E2eeSyncPlugin extends Plugin {
 
     this.engine = new SyncEngine({
       app: this.app,
-      getSettings: () => ({ ...this.settings, encryptionPassword: this.effectivePassword }),
+      getSettings: () => ({
+        ...this.settings,
+        apiToken: this.effectiveApiToken,
+        encryptionPassword: this.effectivePassword,
+      }),
       getJournal: () => this.journal,
       setJournalEntry: (path, record) => {
         if (record) this.journal[path] = record;
@@ -349,7 +364,7 @@ export default class E2eeSyncPlugin extends Plugin {
    */
   async onEncryptionPasswordChanged(oldPassword: string): Promise<void> {
     const newPassword = this.effectivePassword;
-    if (!oldPassword || oldPassword === newPassword) {
+    if (!oldPassword || oldPassword === newPassword || Object.keys(this.journal).length === 0) {
       await this.saveSettings();
       return;
     }
@@ -442,7 +457,7 @@ export default class E2eeSyncPlugin extends Plugin {
   // ------------------------------------------------------------- syncing
 
   requestManualSync(): void {
-    if (!this.settings.serverUrl || !this.settings.apiToken) {
+    if (!this.settings.serverUrl || !this.effectiveApiToken) {
       new Notice('E2EE Sync: set the server URL and API token in the plugin settings first.', 6000);
       return;
     }
@@ -456,7 +471,7 @@ export default class E2eeSyncPlugin extends Plugin {
 
   /** PROB-10: verify every remote entry (hash + decryptability), offer repair. */
   private async runIntegrityCheck(): Promise<void> {
-    if (!this.settings.serverUrl || !this.settings.apiToken || !this.effectivePassword) {
+    if (!this.settings.serverUrl || !this.effectiveApiToken || !this.effectivePassword) {
       new Notice('E2EE Sync: configure the plugin before verifying integrity.', 6000);
       return;
     }
@@ -516,7 +531,7 @@ export default class E2eeSyncPlugin extends Plugin {
    * every live file. The engine reports the dry-run count into the dialog.
    */
   private async runRestoreFromServer(): Promise<void> {
-    if (!this.settings.serverUrl || !this.settings.apiToken || !this.effectivePassword) {
+    if (!this.settings.serverUrl || !this.effectiveApiToken || !this.effectivePassword) {
       new Notice('E2EE Sync: configure the plugin before restoring.', 6000);
       return;
     }
@@ -569,7 +584,7 @@ export default class E2eeSyncPlugin extends Plugin {
 
   private isConfigured(): boolean {
     const s = this.settings;
-    return Boolean(s.serverUrl && s.apiToken && this.effectivePassword);
+    return Boolean(s.serverUrl && this.effectiveApiToken && this.effectivePassword);
   }
 
   private onLayoutReady(): void {
@@ -595,7 +610,7 @@ export default class E2eeSyncPlugin extends Plugin {
       }),
     );
 
-    if (this.settings.serverUrl && this.settings.apiToken) {
+    if (this.settings.serverUrl && this.effectiveApiToken) {
       if (!this.effectivePassword && !this.settings.rememberEncryptionPassword) {
         this.promptForSessionPassword();
         return;
