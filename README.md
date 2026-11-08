@@ -91,6 +91,46 @@ re-asked after each app restart. Client devices must be protected accordingly
 rollback used to be inherent to any untrusted store; since 0.3.0 the
 authenticated version counters make it detectable — see above.)
 
+## Sync features
+
+- **Conflicts.** Both versions are always kept: the remote copy keeps the
+  original path, the local one is saved as `name_conflict_<timestamp>`. With
+  *Auto-merge Markdown conflicts* (off by default) a conflicted `.md` note is
+  first run through a dependency-free three-way line merge (base = last synced
+  copy); non-overlapping edits merge and push automatically, overlapping edits
+  still keep both. Note the trade-off: the merge base is plaintext note
+  content stored in the plugin's `data.json`. Every conflict can also be
+  resolved interactively (*Keep mine / Keep remote / Keep both / Skip*; Esc =
+  keep both) — automatic (timer/event) syncs ask for at most five conflicts
+  per run and batch keep-both for the rest.
+- **Restore from server.** Command-palette entry that wipes this device's
+  journal and re-downloads every live file (dry-run count shown first). Local
+  files are never deleted; files the server does not have stay put.
+- **Ignore patterns.** A `.syncignore` file in the vault root and/or the
+  settings textarea (one glob per line, `**`/`*`/`?`, `#` comments). Ignored
+  paths plan no sync operations of any kind — ignoring never deletes; server
+  entries for newly-ignored paths are left untouched and flagged in the
+  journal. The `.syncignore` file itself never syncs.
+- **Hidden-configuration sync (opt-in, experimental).** Allowlisted files from
+  `.obsidian/` — `appearance.json`, `app.json`, `hotkeys.json`, `snippets/`,
+  `themes/`, plugin bundles (`main.js`, `manifest.json`, `styles.css`) — sync
+  through a separate `config/` server namespace with the same encryption and a
+  separate journal section. `plugins/<id>/data.json` and `workspace.json` stay
+  device-local unless explicitly opted in. Caveat: a real vault folder named
+  `config` in the vault root collides with the namespace and blocks this
+  feature while it exists.
+- **Wi-Fi only (mobile).** *Sync only on Wi-Fi* skips automatic syncs while
+  the device reports a metered connection. Platform support is honest by
+  construction: Android's WebView exposes the connection type (the probe also
+  honors the OS Data Saver), so the gate works there; **iOS's WKWebView does
+  not expose the Network Information API at all**, so on iOS this toggle has
+  no effect and sync proceeds — the plugin refuses to ship a heuristic that
+  guesses. Manual syncs always run.
+- **Large files** travel as content-defined ~64 KiB chunks (stable boundaries
+  under edits, per-chunk retries, per-file progress percentage); the journal
+  stores the previous upload's chunk hashes as the delta-planning baseline for
+  a future server-side reuse protocol.
+
 ## Repository layout
 
 ```

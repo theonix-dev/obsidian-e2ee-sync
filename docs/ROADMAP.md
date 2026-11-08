@@ -25,10 +25,10 @@ Standing principles every solution must respect:
 
 # Section A — Problems in the current code (fix now, in this order)
 
-> **Status (2026-11-06): Section A is complete — all ten items (PROB-1…10)
-> solved and verified in 0.3.0.** Each entry below carries its own status
-> line with the shipped design and its verification evidence. Section B
-> (IMP-1…8) remains the active queue.
+> **Status (2026-11-08): Sections A and B are complete.** Section A
+> (PROB-1…10) shipped in 0.3.0; Section B (IMP-1…8) is implemented and
+> verified on `beta` (see the per-item status lines below). Release
+> management follows the standing rules — tags only on `main`.
 
 ## PROB-1 · Changing the password permanently bricks sync — **P0 · L**
 
@@ -322,6 +322,19 @@ exactly that path; repair restores parity.
 
 ## IMP-1 · Three-way merge for Markdown — **M**
 
+**Status:** ✅ DONE on `beta` — `plugin/src/merge.ts` (dependency-free diff3:
+Myers O(ND) with a D cap of 2048 and a 512 KiB plaintext cap, per-side edit
+hunks, conservative region grouping) wired into `doConflict` behind the
+opt-in `enableMarkdownAutoMerge` toggle (default off, plaintext-at-rest
+disclosure in the settings). Merge base (`SyncRecord.basePlain`) is captured
+on every push/pull/rotation/repair and purged when the toggle goes off. Clean
+merge → written locally + pushed (ver = max+1); any overlap → keep-both. No
+in-text conflict markers ever. Verified: `merge.spec` (33 asserts),
+`engine.spec` [3–5] end-to-end across two devices. *Shipped deviation:* edits
+touching a region adjacent to the other side's insertion resolve as conflicts
+(conservative ordering semantics), and the merge is tried before the IMP-2
+prompt — a clean merge needs no UI.
+
 **Gap.** Conflicts always duplicate (`_conflict_<ts>` copies). For the
 common case — two devices edited different paragraphs of the same note —
 keep-both produces noise the user must resolve by hand.
@@ -339,6 +352,15 @@ regions → clean merge; same-line edits → conflict; mixed line endings.
 
 ## IMP-2 · Interactive conflict resolution — **S**
 
+**Status:** ✅ DONE on `beta` — `resolveConflict` engine hook +
+`ConflictModal` (*Keep mine / Keep remote / Keep both / Skip*, Esc = keep
+both). 'mine' pushes local over the remote original (ver = max+1), 'remote'
+pulls over the local file, 'skip' defers to the next cycle
+(`summary.skipped`). Auto-sync runs prompt for at most five conflicts per run
+(CONFLICT_PROMPT_LIMIT) and batch keep-both for the rest; prompts are
+serialized so the upload pool never stacks two modals; manual runs always
+prompt. Verified: `engine.spec` [6–10].
+
 **Gap.** The user learns about conflicts from a Notice after the fact; the
 "keep both" default is silent.
 
@@ -347,6 +369,13 @@ Skip* (Esc = keep both, current behaviour). Auto-sync runs with >5 conflicts
 skip the modal and batch keep-both to avoid UI storms.
 
 ## IMP-3 · Progress UI — **S**
+
+**Status:** ✅ DONE on `beta` — `setProgress` engine hook (per-op start +
+completion with done/total/phase/path, per-chunk for large uploads);
+`formatProgress` (pure, speced) renders `12/87 — uploading notes/x.md (33%)`
+into the status bar and the ribbon label (mobile mirror). Verified:
+`progress.spec` (9), `engine.spec` [11] incl. the exact chunk-event sequence
+of a 17.5 MiB upload.
 
 **Gap.** During a run the only signal is a status-bar word; large initial
 syncs look hung.
@@ -357,6 +386,14 @@ states only.
 
 ## IMP-4 · "Restore from server" command — **S**
 
+**Status:** ✅ DONE on `beta` — `engine.restoreFromServer(confirm)` wipes the
+journal (both namespaces), plans pulls for every live entry against an empty
+local snapshot (deletes unrepresentable by construction), re-baselines
+version history intentionally, and keeps the write-time case-collision guard.
+The command shows a dry-run live-file count (verifiers excluded) in a confirm
+dialog; declining aborts untouched. Verified: `engine.spec` [12] — fresh
+pull, stale overwrite, local-only preservation, declined confirm.
+
 **Gap.** A new/broken device must reverse-engineer that clearing settings
 triggers a full pull; there is no explicit fresh-clone path.
 
@@ -365,6 +402,16 @@ pulls everything live (never deletes; the mass-deletion guard is
 inapplicable by construction).
 
 ## IMP-5 · User ignore patterns — **S**
+
+**Status:** ✅ DONE on `beta` — `plugin/src/ignore.ts` (tiny gitignore-flavoured
+glob matcher: `**`/`*`/`?`, anchoring by slash, segment-anywhere matching for
+unanchored patterns, trailing-`/` directories, `#` comments, no negation)
+plugs into `isSyncablePath`/`planSync` via an optional matcher argument.
+Sources merge per cycle: the settings textarea + a vault-root `.syncignore`
+(device-local — never synced), cached by content. Ignored paths plan zero ops
+— ignoring never deletes; server entries stay untouched and journal records
+are flagged `ignored` (cleared when the path syncs again). Verified:
+`ignore.spec` (36), `planSync.spec` [8], `engine.spec` [13].
 
 **Gap.** Exclusions are hardcoded (config dir, `.trash/`, OS junk). Users
 cannot keep e.g. `private/` or `*.bak` off the server.
@@ -375,6 +422,18 @@ Ignoring never deletes: existing remote entries for newly-ignored paths are
 left untouched and marked "ignored" in the journal view.
 
 ## IMP-6 · Hidden-file / configuration sync (opt-in) — **M**
+
+**Status:** ✅ DONE on `beta` — server namespace `config/<rest>` (no server
+change; the AAD binds the server path), separate journal section
+(`PluginData.configJournal`), per-group allowlist (`ConfigSyncSettings`):
+appearance/app/hotkeys/snippets/themes/pluginCode on by default,
+`plugins/<id>/data.json` and `workspace.json` opt-in per checkbox, everything
+unrecognized never syncs (`isConfigSyncablePath`). Ops carry `localPath` so
+the executor maps server↔vault paths; conflict copies and case-renames stay
+in-namespace; rotate/repair/verify/restore cover config entries. The vault
+plan always excludes `config/*` remote entries, and a real root-level vault
+folder named `config` blocks the feature with a notice (documented in the
+README). Verified: `planSync.spec` [9], `engine.spec` [14–16].
 
 **Gap.** `.obsidian/` is excluded outright: themes, snippets, hotkeys and
 plugin sets don't follow the user across devices (Self-hosted LiveSync's
@@ -390,6 +449,22 @@ counters and the mass-deletion guard apply unchanged.
 
 ## IMP-7 · Content-defined chunking (delta sync) — **L · depends on PROB-3**
 
+**Status:** ✅ DONE on `beta` with a scope deviation — `plugin/src/cdc.ts`
+(32-bit gear rolling hash, 32-byte window, min 16 KiB / avg 64 KiB / max
+1 MiB, fixed-seed table → deterministic across devices) replaces the fixed
+8 MiB cut for large uploads; `baseChunkHashes` (plaintext chunk hashes,
+already computed for the manifest) stored in the journal as the delta
+baseline, capped at 2048 chunks per record; fixed 8 MiB slicing remains the
+fallback past the server's 100 000-chunk staging cap. Verified: `cdc.spec`
+(22, incl. the ≥90 % boundary-stability property under insert/delete/edit),
+`engine.spec` [11, 17] — a 1-byte edit into a 17.5 MiB file re-uploads with
+204/205 chunk hashes unchanged. *Shipped deviation (honest scope):* the
+"delta sync" win is boundary stability, retry granularity and the stored
+baseline — actually uploading only changed chunks is impossible client-side
+because every packet re-encrypts with a fresh IV and binds version+manifest
+in its AAD (the rollback/splicing defenses). Byte-level delta transfer needs
+a future server-side chunk-reuse protocol → tracked as BK-6.
+
 **Gap.** Even chunked, editing one line of a large note re-uploads all of
 it (all ciphertext changes with the same key only if the plaintext changed
 everywhere — but a fixed cut shifts at every insert).
@@ -401,6 +476,17 @@ per-chunk AAD adds the whole-file hash + chunk index. Journal stores
 staging already accepts arbitrary chunk layouts.
 
 ## IMP-8 · Mobile connection hygiene (research) — **M**
+
+**Status:** ✅ DONE on `beta` — research verdict implemented in
+`plugin/src/connection.ts`: navigator.connection exists in the Android System
+WebView (Chromium) but historically misreported values there (crbug 520088)
+and still reports `type: 'unknown'` in some builds; iOS's WKWebView does not
+expose the API at all. The probe trusts exactly three signals — type
+wifi/ethernet (unmetered), cellular (metered), saveData (metered) — and
+reports 'unsupported' otherwise. The `wifiOnly` setting gates periodic and
+startup syncs only (manual syncs always run) and NEVER blocks on unsupported
+platforms — the settings description and README state this plainly instead of
+shipping a heuristic that lies. Verified: `connection.spec` (19).
 
 **Gap.** No "Wi-Fi only" option; sync over metered mobile data can be
 expensive in some regions.
@@ -421,6 +507,7 @@ heuristic that lies.
 | BK-3 | Formal unit tests for `crypto.ts` (vitest, Node WebCrypto) | Partially covered by the smoke harness; formalise alongside PROB-1. |
 | BK-4 | First-run onboarding wizard | Settings tab suffices while the audience is technical. |
 | BK-5 | minisign signatures beyond GitHub attestations | Attestations already generated; marginal gain. |
+| BK-6 | Server-side chunk reuse for true delta uploads | IMP-7 ships the CDC boundaries and the journal baseline; re-uploading only changed chunks needs a staging protocol that references the previous blob (server change + AAD design that keeps rollback detection). |
 
 # Explicitly rejected (recorded so they are not relitigated)
 

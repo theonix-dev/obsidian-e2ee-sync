@@ -4,6 +4,74 @@ All notable changes to this project are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+Roadmap Section B (improvements register) — see `docs/ROADMAP.md`. Implemented
+on `beta`; no release has been cut from this branch.
+
+### Added
+
+- **IMP-1 · Three-way merge for Markdown (opt-in).** The new *Auto-merge
+  Markdown conflicts* toggle (default **off**) runs a conflicted `.md` note
+  through a dependency-free diff3 line merge — non-overlapping edits from two
+  devices merge and push automatically; overlapping edits still keep both.
+  Trade-off, stated in the settings: the merge base is plaintext note content
+  stored in the plugin's `data.json` (and purged everywhere when the toggle
+  goes off). Merge bases are captured on every successful push, pull,
+  rotation and integrity repair.
+- **IMP-2 · Interactive conflict resolution.** Conflicts can now be resolved
+  in the moment: *Keep mine* (uploads your version), *Keep remote* (discards
+  local edits — warned), *Keep both* (previous default), *Skip* (decide
+  nothing, asked again next sync; Esc = keep both). Automatic syncs prompt for
+  at most five conflicts per run and batch keep-both for the rest; prompts
+  never stack.
+- **IMP-3 · Live progress.** The status bar and ribbon show
+  `12/87 — uploading notes/x.md` during a run, with a per-file percentage
+  while large chunked uploads are in flight.
+- **IMP-4 · "Restore from server" command.** Explicit fresh-clone path: shows
+  a dry-run count, wipes this device's journal, and re-downloads every live
+  file. Local files are never deleted; files the server does not have stay
+  put; the case-collision write guard still applies.
+- **IMP-5 · User ignore patterns.** A `.syncignore` file in the vault root
+  and/or a settings textarea (tiny gitignore-style globs: `**`, `*`, `?`,
+  anchoring, directory patterns, `#` comments). Ignored paths plan no sync
+  operations of any kind — **ignoring never deletes**: server entries for
+  newly-ignored paths are left untouched and flagged `ignored` in the journal.
+  The `.syncignore` file itself never syncs.
+- **IMP-6 · Hidden-configuration sync (opt-in, experimental).** Allowlisted
+  files from `.obsidian/` (`appearance.json`, `app.json`, `hotkeys.json`,
+  `snippets/`, `themes/`, plugin bundles) sync through a separate `config/`
+  server namespace — same encryption, separate journal section, no server
+  change. `plugins/<id>/data.json` and `workspace.json` stay device-local
+  unless explicitly opted in. A real root-level vault folder named `config`
+  collides with the namespace and blocks the feature with a notice.
+- **IMP-8 · Wi-Fi only (mobile connection hygiene).** *Sync only on Wi-Fi*
+  skips automatic syncs while the device reports a metered connection
+  (cellular, or the OS Data Saver enabled). Manual syncs always run. The
+  probe trusts only explicit signals and **never blocks on platforms that do
+  not expose a connection type (iOS)** — documented honestly in the settings
+  and README instead of shipping a heuristic that lies.
+- Password rotation, integrity repair and restore now also carry the new
+  journal metadata (merge bases, chunk baselines) for config-namespace
+  entries.
+
+### Changed
+
+- **IMP-7 · Content-defined chunking for large files.** Files above 16 MiB
+  upload as ~64 KiB content-defined chunks (gear rolling hash, deterministic
+  across devices) instead of fixed 8 MiB slices: boundaries stay stable under
+  edits, retries re-send only ~64 KiB, and the journal stores the previous
+  upload's plaintext chunk hashes as the baseline for a future server-side
+  delta protocol (tracked as BK-6 — today every chunk is still re-encrypted
+  and re-uploaded; only the boundary stability and journal baseline are
+  shipped). Fixed 8 MiB slicing remains as the fallback past the server's
+  100 000-chunk staging cap. The server protocol is unchanged.
+
+### Notes
+
+- No release tag exists for this work yet: per the standing rules, tags are
+  cut only on `main`. `beta` carries the integration state.
+
 ## [0.3.0] — 2026-11-06
 
 Whole of the roadmap's Section A (problems register) — see `docs/ROADMAP.md`.
